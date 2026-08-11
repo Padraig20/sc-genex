@@ -46,7 +46,7 @@ from src.dataset import (
     SingleCellDonorDataset,
     collate_donor_batch,
 )
-from src.genome import GeneAnnotation, ReferenceGenome, VCFGenotypeReader
+from src.genome import GeneAnnotation, ReferenceGenome, VCFGenotypeReader, onek1k_sample_id_from_donor_id
 from src.loss import per_cell_gaussian_nll
 from src.metrics import pseudobulk_correlation, sigma_calibration_correlation
 from src.model import VariformerGNLL
@@ -84,9 +84,28 @@ def parse_args() -> argparse.Namespace:
     genome_group.add_argument("--gtf", required=True, help="GTF/GFF gene annotation, used for TSS lookup")
     genome_group.add_argument("--seq-len", type=int, default=49152)
     genome_group.add_argument(
+        "--vcf-sample-id-scheme",
+        choices=["onek1k", "identity"],
+        default="onek1k",
+        help=(
+            "How to map h5ad donor_id -> genotype-file sample ID. 'onek1k' (default) "
+            "implements the confirmed OneK1K convention: donor_id '{X}_{Y}' -> sample "
+            "ID '{prefix}{Y}' (e.g. '10_10' -> 'OneK1K_10'). 'identity' assumes they "
+            "are the same string. Use --donor-id-map for exceptions to either."
+        ),
+    )
+    genome_group.add_argument(
+        "--vcf-sample-id-prefix",
+        default="OneK1K_",
+        help="Prefix used by --vcf-sample-id-scheme=onek1k (ignored otherwise)",
+    )
+    genome_group.add_argument(
         "--donor-id-map",
         default=None,
-        help="Optional 2-column CSV (h5ad_donor_id,vcf_sample_id) if donor IDs differ between h5ad and VCFs",
+        help=(
+            "Optional 2-column CSV (h5ad_donor_id,vcf_sample_id) for donors that don't "
+            "follow --vcf-sample-id-scheme; entries here always take precedence"
+        ),
     )
 
     model_group = parser.add_argument_group("model")
@@ -134,6 +153,11 @@ def build_datasets(args: argparse.Namespace):
     vcf_reader = VCFGenotypeReader(args.vcf_dir, filename_template=args.vcf_filename_template)
     donor_id_map = load_donor_id_map(args.donor_id_map)
 
+    if args.vcf_sample_id_scheme == "onek1k":
+        sample_id_fn = lambda donor_id: onek1k_sample_id_from_donor_id(donor_id, prefix=args.vcf_sample_id_prefix)
+    else:
+        sample_id_fn = lambda donor_id: donor_id
+
     sequence_builder = DonorSequenceBuilder(
         reference=reference,
         vcf_reader=vcf_reader,
@@ -141,6 +165,7 @@ def build_datasets(args: argparse.Namespace):
         seq_len=args.seq_len,
         vcf_chrom_style=args.vcf_chrom_style,
         donor_id_to_sample_id=donor_id_map,
+        sample_id_fn=sample_id_fn,
     )
 
     train_ds = SingleCellDonorDataset(split.train, table, sequence_builder)

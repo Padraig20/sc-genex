@@ -272,6 +272,24 @@ def build_personalized_onehot(
     return onehot
 
 
+def onek1k_sample_id_from_donor_id(donor_id: str, prefix: str = "OneK1K_") -> str:
+    """Maps an h5ad `donor_id` to the genotype-file sample ID for OneK1K.
+
+    The h5ad's `obs['donor_id']` is formatted `"{X}_{Y}"` (e.g. `"10_10"`), but
+    the genotype files (VCF/PLINK) use individual IDs formatted `"{prefix}{Y}"`
+    (e.g. `"OneK1K_10"`) -- i.e. only the second, `Y`, component is used, not
+    the first. This was confirmed against a real `.fam` file:
+
+        0   OneK1K_1     0   0   2   -9
+        0   OneK1K_10    0   0   2   -9
+        0   OneK1K_100   0   0   0   -9
+
+    Do not assume `donor_id` and the genotype sample ID are identical.
+    """
+    suffix = donor_id.rsplit("_", 1)[-1]
+    return f"{prefix}{suffix}"
+
+
 def chrom_for_gene(gene: GeneRecord, vcf_chrom_style: Optional[str] = None) -> str:
     """Normalizes chromosome naming between GTF ('chr1' or '1') and VCF conventions."""
     chrom = gene.chrom

@@ -54,9 +54,26 @@ must supply, as CLI arguments:
 
 - `--vcf-dir`: a directory with one **bgzip + tabix-indexed** VCF per chromosome (biallelic SNPs,
   standard `GT` field), e.g. `chr1.vcf.gz` .. `chr22.vcf.gz` or `1.vcf.gz` .. `22.vcf.gz`
-  (configurable via `--vcf-filename-template`). Sample names are assumed to equal the h5ad's
-  `donor_id` (e.g. `"1_1"`) unless you pass `--donor-id-map path/to/mapping.csv` (2-column CSV:
-  `h5ad_donor_id,vcf_sample_id`).
+  (configurable via `--vcf-filename-template`).
+
+  **Sample naming is *not* the identity mapping.** The h5ad's `obs['donor_id']` is formatted
+  `"{X}_{Y}"` (e.g. `"10_10"`), but the real OneK1K genotype files use individual IDs formatted
+  `"OneK1K_{Y}"` -- confirmed against an actual `.fam` file:
+
+  ```
+  0   OneK1K_1     0   0   2   -9
+  0   OneK1K_10    0   0   2   -9
+  0   OneK1K_100   0   0   0   -9
+  ```
+
+  i.e. only the second (`Y`) component of `donor_id` is used, prefixed with `OneK1K_`. This is the
+  **default** (`--vcf-sample-id-scheme onek1k`, `--vcf-sample-id-prefix "OneK1K_"`). Pass
+  `--vcf-sample-id-scheme identity` if your genotype files instead use the donor_id string directly,
+  or `--donor-id-map path/to/mapping.csv` (2-column CSV: `h5ad_donor_id,vcf_sample_id`) for any
+  donors that don't follow the default convention -- explicit mapping entries always take
+  precedence. If a sample ID can't be found in the VCF, `VCFGenotypeReader` raises a `KeyError`
+  naming the missing sample rather than silently falling back, so naming mismatches surface
+  immediately instead of corrupting training.
 - `--genome-fasta`: an indexed reference genome FASTA matching the VCFs' build (e.g. hg38,
   `samtools faidx` run once beforehand).
 - `--gtf`: a GTF/GFF gene annotation (Ensembl/GENCODE-style) whose `gene_id` matches the h5ad's
@@ -126,7 +143,10 @@ biologically-meaningful training was not run. Instead, correctness was verified 
 - A full end-to-end integration run of `src/train.py` against the **real** OneK1K h5ad (a small cell
   type) combined with a **synthetic** genome/VCF (random genotypes, since real ones aren't available)
   and `--random-weights`: confirmed the CLI runs to completion, training loss decreases, and
-  prediction CSVs / checkpoints are written correctly.
+  prediction CSVs / checkpoints are written correctly. This included a synthetic VCF using
+  `OneK1K_{Y}`-style sample IDs (not identical to the h5ad `donor_id`), confirming the default
+  `--vcf-sample-id-scheme onek1k` mapping resolves donors correctly with no explicit
+  `--donor-id-map` needed, and that mismatched IDs fail loudly (`KeyError`) rather than silently.
 
 ## Out of scope for this POC
 

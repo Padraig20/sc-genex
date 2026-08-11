@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -32,11 +32,21 @@ from src.genome import (
     build_personalized_onehot,
     chrom_for_gene,
     get_tss_window,
+    onek1k_sample_id_from_donor_id,
 )
 
 
 class DonorSequenceBuilder:
-    """Builds (and caches) the personalized one-hot sequence for a gene, per donor."""
+    """Builds (and caches) the personalized one-hot sequence for a gene, per donor.
+
+    IMPORTANT: the h5ad `donor_id` (e.g. `"10_10"`) is *not* generally the same
+    string as the corresponding sample ID in the genotype files (e.g.
+    `"OneK1K_10"`, confirmed against a real OneK1K `.fam` file). By default this
+    resolves the genotype sample ID via `sample_id_fn` (which defaults to the
+    OneK1K `"{X}_{Y}" -> "OneK1K_{Y}"` convention). `donor_id_to_sample_id` is
+    an optional explicit override dict, checked first, for any donors that
+    don't follow the default convention.
+    """
 
     def __init__(
         self,
@@ -46,6 +56,7 @@ class DonorSequenceBuilder:
         seq_len: int,
         vcf_chrom_style: Optional[str] = None,
         donor_id_to_sample_id: Optional[Dict[str, str]] = None,
+        sample_id_fn: Callable[[str], str] = onek1k_sample_id_from_donor_id,
     ):
         self.reference = reference
         self.vcf_reader = vcf_reader
@@ -54,11 +65,17 @@ class DonorSequenceBuilder:
         self.chrom = chrom_for_gene(gene, vcf_chrom_style)
         self.start, self.end = get_tss_window(gene, seq_len)
         self.donor_id_to_sample_id = donor_id_to_sample_id or {}
+        self.sample_id_fn = sample_id_fn
         self._cache: Dict[str, np.ndarray] = {}
+
+    def resolve_sample_id(self, donor_id: str) -> str:
+        if donor_id in self.donor_id_to_sample_id:
+            return self.donor_id_to_sample_id[donor_id]
+        return self.sample_id_fn(donor_id)
 
     def build(self, donor_id: str) -> np.ndarray:
         if donor_id not in self._cache:
-            sample_id = self.donor_id_to_sample_id.get(donor_id, donor_id)
+            sample_id = self.resolve_sample_id(donor_id)
             self._cache[donor_id] = build_personalized_onehot(
                 self.reference, self.vcf_reader, sample_id, self.chrom, self.start, self.end
             )
