@@ -168,19 +168,30 @@ It reports:
    the sequence model learning something subtle.
 3. **Top individual variants** in the training window ranked by raw correlation with pseudobulk
    expression -- a single variant with a large, significant correlation is itself a red flag for
-   "simple eQTL, not complex grammar."
-4. **A cheap linear-eQTL baseline**: ridge regression directly on raw SNP dosages in the same
-   TSS window used for training, evaluated on the identical train/val/test donor split. If this
-   baseline's test Pearson r/R2 is close to Enformer's (especially with `--predictions-csv` passed),
-   the deep sequence model likely isn't adding much beyond what a standard eQTL scan would find.
-5. **Permutation tests** (label-shuffling, not relying on any normality assumption): one for the
-   cheap baseline (shuffles training labels only, keeps the real test labels, to check whether the
-   observed test performance exceeds what could happen by chance given how few training donors and
-   how many variants there are), and one for your actual model's predictions if you pass
-   `--predictions-csv` (shuffles the pairing between predictions and true values on the fixed test
-   set, to check whether the observed correlation exceeds chance given only `n_test` donors -- this
-   matters a lot when `n_test` is ~20-30, which is common after an 85/15 split on OneK1K's ~500-900
-   donors per cell type).
+   "simple eQTL, not complex grammar." Computed separately for `mu` (pseudobulk mean) and `sigma`
+   (empirical cell-cell std) -- see point 4.
+4. **An elastic-net baseline, for *both* `mu` and `sigma`**: elastic net regression (L1+L2, like a
+   PrediXcan/TWAS model -- the standard approach for predicting a trait from many correlated,
+   LD-linked SNPs) directly on raw SNP dosages in the same TSS window used for training, evaluated
+   on the identical train/(val+)test donor split (`alpha`/`l1_ratio` are selected via
+   `ElasticNetCV`'s internal k-fold CV on train+val). Run once against the pseudobulk mean (a
+   standard eQTL-style question) and once against the empirical cell-cell std (a **vQTL-style**
+   question: is cell-to-cell variability itself locally genetically determined, or does the
+   sequence model have to work harder to predict it than it does for the mean?). If either
+   baseline's test Pearson r/R2 is close to Enformer's (especially with `--predictions-csv`
+   passed), the deep sequence model likely isn't adding much beyond what a standard eQTL/vQTL scan
+   would find for that head. The script also prints a direct `mu` vs. `sigma` baseline comparison
+   with an interpretation: comparable R2/significance for both suggests a genuine genetic
+   component to expression variability at this locus (not just sampling noise); a much weaker
+   `sigma` baseline suggests variability is harder to explain from local genotype alone.
+5. **Permutation tests** (label-shuffling, not relying on any normality assumption): one for each
+   of the `mu`/`sigma` baselines (shuffles the fit-set labels only, keeps the real test labels, to
+   check whether the observed test performance exceeds what could happen by chance given how few
+   donors and how many variants there are), and one for your actual model's predictions (each head
+   separately) if you pass `--predictions-csv` (shuffles the pairing between predictions and true
+   values on the fixed test set, to check whether the observed correlation exceeds chance given
+   only `n_test` donors -- this matters a lot when `n_test` is ~20-30, which is common after an
+   85/15 split on OneK1K's ~500-900 donors per cell type).
 6. **Model prediction-quality stats and plots for *both* heads**, if `--predictions-csv` is given:
    Pearson r, Pearson p, R2, and the permutation p-value for `mu` (vs. true pseudobulk mean) *and*
    separately for `sigma` (vs. true empirical cell-cell std) -- since the whole point of this POC
@@ -193,27 +204,34 @@ It reports:
    - **permutation p**: the assumption-free version of Pearson p from point 5 above, applied to
      `mu` and `sigma` individually.
 
-If `--out-dir` is given it also saves `diagnostics_summary.json`, `top_variants.csv`, a 4-panel
-`diagnostics.png` (pseudobulk histogram, `n_cells` confound scatter, top-variant scatter, and the
-baseline permutation null distribution with the observed value marked), and -- if
+If `--out-dir` is given it also saves `diagnostics_summary.json`, `top_variants_mu.csv` /
+`top_variants_sigma.csv`, a 6-panel `diagnostics.png` (top row: pseudobulk histogram, `n_cells`
+confound scatter, top-`mu`-variant scatter; bottom row: `mu` baseline's permutation null
+distribution, top-`sigma`-variant scatter, `sigma` baseline's permutation null distribution -- so
+the `mu` and `sigma` diagnostics sit side by side for easy comparison), and -- if
 `--predictions-csv` was given -- `model_predictions_vs_truth.png`: a 2-panel predicted-vs-true
 scatter plot (test set), one panel for `mu` and one for `sigma`, each with a `y = x` reference line
 and the Pearson r/p, R2, permutation-p stats annotated directly on the plot.
 
-As a sanity check that a *real* gene x cell-type effect, a *simple* large eQTL, and *pure noise*
-are all distinguishable, `src/diagnose.py` was validated against synthetic (random, unlinked to
-expression) genotypes: the linear baseline and both permutation tests correctly reported no
-significant signal (p ~ 0.2-0.9), as expected when there's no true genotype-phenotype relationship.
+As a sanity check that a *real* gene x cell-type effect, a *simple* large eQTL/vQTL, and *pure
+noise* are all distinguishable, `src/diagnose.py` was validated against two synthetic genotype
+setups on the same real expression data: (a) random genotypes unlinked to expression, where the
+elastic-net baselines and all permutation tests correctly reported no significant signal for
+either `mu` or `sigma` (p ~ 0.2-0.9); and (b) genotypes with a deliberately planted, imperfect
+(85%-penetrant) linear effect on `mu` from one set of variants and on `sigma` from a *different*
+set of variants, where the baselines correctly recovered both effects (test R2 ~ 0.67-0.68,
+permutation p = 0/300 for each) and the `mu`-vs-`sigma` comparison correctly flagged the
+"comparable genetic signal for both" case.
 
 **Constant targets are handled explicitly, not as a crash.** Pseudobulk targets (or empirical
 stds) can legitimately be constant across donors -- e.g. an undetected gene, or a cell type where
 almost every donor has only 1 cell of that type (so empirical std is 0 everywhere). Pearson
-correlation, R2, skewness, and ridge-target-centering are all undefined or ill-posed in that case.
+correlation, R2, skewness, and elastic-net fitting are all undefined or ill-posed in that case.
 Both `src/train.py` (via `src/metrics.py`) and `src/diagnose.py` detect this up front (`np.std(...)
 == 0`, not just relying on NaN propagation) and print an explicit "skipping" note instead of
-raising, warning noisily (especially inside the `n_permutations`-iteration loops), or -- in one
-case in `src/diagnose.py`'s ridge alpha-selection -- crashing outright when every candidate's
-validation R2 came back `NaN`.
+raising or warning noisily (especially inside the `n_permutations`-iteration loops), independently
+for `mu` and `sigma` -- so if, say, `sigma` happens to be constant but `mu` isn't, the `mu`
+diagnostics still run normally and only the `sigma` section is skipped.
 
 ## Testing performed
 
@@ -236,13 +254,26 @@ biologically-meaningful training was not run. Instead, correctness was verified 
   `OneK1K_{Y}`-style sample IDs (not identical to the h5ad `donor_id`), confirming the default
   `--vcf-sample-id-scheme onek1k` mapping resolves donors correctly with no explicit
   `--donor-id-map` needed, and that mismatched IDs fail loudly (`KeyError`) rather than silently.
-- A full end-to-end run of `src/diagnose.py` against the same real-h5ad + synthetic-genome/VCF
-  setup, including the `--predictions-csv` comparison path fed from a `--random-weights` `train.py`
-  run: confirmed all sections (distribution stats, MHC flag, top variants, ridge baseline,
-  both permutation tests, plots/JSON/CSV output) execute correctly and report statistically
-  sensible results (no false "significant" signal) on genotypes with no real relationship to
-  expression. Also unit-tested `is_in_mhc_region` against real HLA-DRB5 and ACTB coordinates, and
-  the ridge/permutation-test helpers against a synthetic case with a known linear relationship.
+- A full end-to-end run of `src/diagnose.py` against real OneK1K expression (ACTB x naive B cell,
+  which has genuine cross-donor variance in both `mu` and `sigma`) combined with a synthetic VCF of
+  genotypes unlinked to expression: confirmed all sections (distribution stats, MHC flag, top
+  variants, elastic-net baselines, permutation tests, plots/JSON/CSV output) execute correctly for
+  *both* `mu` and `sigma` and report no false "significant" signal (p ~ 0.4-0.65) on genotypes with
+  no real relationship to expression.
+- The same setup repeated with a synthetic VCF containing a deliberately planted, imperfect linear
+  effect -- a different set of variants tagging `mu` vs. `sigma` -- confirming the elastic-net
+  baselines correctly recover both planted effects (test R2 ~ 0.67 for `mu`, ~0.68 for `sigma`,
+  permutation p = 0/300 for each), that the top-variant tables correctly surface the *correct*
+  tagging variants for each target, and that the `mu`-vs-`sigma` "can genotype predict variability
+  as well as it predicts the mean?" comparison correctly reports the "comparable genetic signal"
+  case.
+- The `--predictions-csv` comparison path was exercised with a synthetic predictions CSV (true
+  values plus Gaussian noise) built from the same real test-set donors, confirming the
+  Enformer-vs-baseline comparison, JSON summary (`mu_baseline`/`sigma_baseline` keys), and both
+  plot files render correctly.
+- Also unit-tested `is_in_mhc_region` against real HLA-DRB5 and ACTB coordinates, and the
+  elastic-net/permutation-test helpers directly against a synthetic case with a known linear
+  relationship.
 - The `mu`/`sigma` model prediction-quality stats and `model_predictions_vs_truth.png` plot were
   exercised against real `--predictions-csv` output from that same `--random-weights` run
   (confirming both panels render and the annotated stats match a manual recomputation) and against
