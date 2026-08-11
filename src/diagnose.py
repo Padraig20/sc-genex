@@ -29,6 +29,11 @@ Checks performed:
      p-values for both the cheap baseline and, if provided, the actual
      Enformer test predictions -- flags results that look strong mostly
      because the test set is small.
+  6. If `--predictions-csv` is given: prediction-quality stats (Pearson r,
+     Pearson p, R2, plus a permutation p-value) *and* a predicted-vs-true
+     scatter plot for *both* heads -- `mu` (mean expression) and `sigma`
+     (cell-cell std) -- on the test set, since "amazing results" usually
+     refers to `mu` but the whole point of this POC is also `sigma`.
 
 Example:
     python src/diagnose.py \\
@@ -63,7 +68,7 @@ from src.genome import (
     get_tss_window,
     onek1k_sample_id_from_donor_id,
 )
-from src.metrics import r2_score
+from src.metrics import CorrelationResult, pseudobulk_correlation, r2_score, sigma_calibration_correlation
 
 # GRCh38 coordinates of the classical MHC region (chr6), 0-based-inclusive-ish;
 # exact boundaries vary slightly by source, this is the commonly used span.
@@ -366,6 +371,116 @@ def permutation_test_predictions(
 
 
 # --------------------------------------------------------------------------- #
+# Model prediction quality (mu and sigma, from a completed train.py run)
+# --------------------------------------------------------------------------- #
+
+STATS_GLOSSARY = (
+    "  Pearson r:      linear correlation between predicted and true values, range -1..1 "
+    "(1 = perfect positive correlation, 0 = none, -1 = perfect inverse).\n"
+    "  Pearson p:      parametric significance of that r, assuming bivariate normality -- "
+    "probability of seeing |r| this large by chance if truly uncorrelated; smaller = more significant.\n"
+    "  R2:             fraction of the true values' variance explained by the predictions "
+    "(1 = perfect, 0 = no better than always predicting the mean, <0 = worse than that).\n"
+    "  permutation p:  assumption-free version of Pearson p -- fraction of random re-pairings of "
+    "the same predictions/true values that correlate at least as strongly; more robust than the "
+    "parametric p-value when n is small or non-normal."
+)
+
+
+@dataclass
+class ModelEvalResult:
+    corr: CorrelationResult
+    permutation_p: float
+
+
+def evaluate_model_predictions(
+    pred_df: pd.DataFrame, n_permutations: int, rng: np.random.RandomState
+) -> Tuple[ModelEvalResult, ModelEvalResult]:
+    """Prediction-quality stats for both model heads on a `predictions_test_final.csv`-style df.
+
+    `mu` is evaluated against the true pseudobulk mean, `sigma` against the true empirical
+    cell-cell std -- exactly the two correlations `train.py` optimizes for and reports each
+    epoch, recomputed here so they can be examined/plotted independently of a training run.
+    """
+    y_true_mean = pred_df["y_true_pseudobulk_mean"].to_numpy()
+    y_pred_mu = pred_df["y_pred_mu"].to_numpy()
+    y_true_std = pred_df["y_true_empirical_std"].to_numpy()
+    y_pred_sigma = pred_df["y_pred_sigma"].to_numpy()
+
+    mu_corr = pseudobulk_correlation(y_pred_mu, y_true_mean)
+    sigma_corr = sigma_calibration_correlation(y_pred_sigma, y_true_std)
+    _, _, mu_perm_p = permutation_test_predictions(y_true_mean, y_pred_mu, n_permutations, rng)
+    _, _, sigma_perm_p = permutation_test_predictions(y_true_std, y_pred_sigma, n_permutations, rng)
+
+    return ModelEvalResult(mu_corr, mu_perm_p), ModelEvalResult(sigma_corr, sigma_perm_p)
+
+
+def make_model_evaluation_plots(out_dir: str, pred_df: pd.DataFrame, mu_eval: ModelEvalResult, sigma_eval: ModelEvalResult) -> None:
+    """Predicted-vs-true scatter plots (test set) for both `mu` and `sigma`, each annotated
+    with Pearson r/p, R2, and n -- the direct visual answer to "how well does the model
+    actually predict mean expression, and separately, cell-cell variability?"
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[plots] matplotlib not installed, skipping model-evaluation plots")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+
+    def _scatter_with_stats(ax, y_true: np.ndarray, y_pred: np.ndarray, title: str, xlabel: str, ylabel: str, result: ModelEvalResult) -> None:
+        if len(y_true) == 0:
+            ax.axis("off")
+            ax.text(0.5, 0.5, "no data", ha="center", va="center")
+            return
+        ax.scatter(y_true, y_pred, s=16, alpha=0.65, edgecolors="none")
+        lo, hi = min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())
+        ax.plot([lo, hi], [lo, hi], "k--", linewidth=1, label="y = x")
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        corr = result.corr
+        stats_text = (
+            f"pearson r = {corr.pearson_r:.3f}\npearson p = {corr.pearson_p:.3g}\n"
+            f"R2 = {corr.r2:.3f}\npermutation p = {result.permutation_p:.3g}\nn = {corr.n}"
+        )
+        ax.text(
+            0.03, 0.97, stats_text, transform=ax.transAxes, va="top", ha="left", fontsize=9,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+        )
+        ax.legend(loc="lower right", fontsize=8)
+
+    _scatter_with_stats(
+        axes[0],
+        pred_df["y_true_pseudobulk_mean"].to_numpy(),
+        pred_df["y_pred_mu"].to_numpy(),
+        "mu: predicted vs. true pseudobulk mean (test set)",
+        "true pseudobulk mean",
+        "predicted mu",
+        mu_eval,
+    )
+    _scatter_with_stats(
+        axes[1],
+        pred_df["y_true_empirical_std"].to_numpy(),
+        pred_df["y_pred_sigma"].to_numpy(),
+        "sigma: predicted vs. true empirical std (test set)",
+        "true empirical std",
+        "predicted sigma",
+        sigma_eval,
+    )
+
+    fig.tight_layout()
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "model_predictions_vs_truth.png")
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"[plots] saved to {out_path}")
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -583,23 +698,37 @@ def main() -> None:
                 print()
 
     predictions_summary = None
+    mu_eval = sigma_eval = None
+    pred_df = None
     if args.predictions_csv is not None:
         pred_df = pd.read_csv(args.predictions_csv)
-        y_true = pred_df["y_true_pseudobulk_mean"].to_numpy()
-        y_pred = pred_df["y_pred_mu"].to_numpy()
+        y_true_mean = pred_df["y_true_pseudobulk_mean"].to_numpy()
+        y_true_std = pred_df["y_true_empirical_std"].to_numpy()
 
-        if is_constant(y_true) or is_constant(y_pred):
-            print(
-                "--- Enformer model vs. cheap linear baseline: skipped (constant true value or prediction "
-                "in --predictions-csv) ---\n"
-            )
+        print("--- Model prediction quality: mu and sigma (test set, from --predictions-csv) ---")
+        print(STATS_GLOSSARY)
+        if is_constant(y_true_mean):
+            print("[!] note: true pseudobulk means in --predictions-csv are constant -- mu stats are undefined (nan)")
+        if is_constant(y_true_std):
+            print("[!] note: true empirical stds in --predictions-csv are constant -- sigma stats are undefined (nan)")
+
+        mu_eval, sigma_eval = evaluate_model_predictions(pred_df, args.n_permutations, rng)
+        print(
+            f"mu (mean expression):  pearson_r={mu_eval.corr.pearson_r:.4f} pearson_p={mu_eval.corr.pearson_p:.4g} "
+            f"r2={mu_eval.corr.r2:.4f} permutation_p={mu_eval.permutation_p:.4g} (n={mu_eval.corr.n})"
+        )
+        print(
+            f"sigma (cell-cell std):  pearson_r={sigma_eval.corr.pearson_r:.4f} pearson_p={sigma_eval.corr.pearson_p:.4g} "
+            f"r2={sigma_eval.corr.r2:.4f} permutation_p={sigma_eval.permutation_p:.4g} (n={sigma_eval.corr.n})"
+        )
+        print()
+
+        model_r, model_r2 = mu_eval.corr.pearson_r, mu_eval.corr.r2
+        if np.isnan(model_r):
+            print("--- Enformer mu vs. cheap linear baseline: skipped (constant true value or prediction) ---\n")
         else:
-            model_r, _ = safe_pearsonr(y_true, y_pred)
-            model_r2 = r2_score(y_true, y_pred)
-            _, _, model_perm_p = permutation_test_predictions(y_true, y_pred, args.n_permutations, rng)
-
-            print("--- Enformer model vs. cheap linear baseline ---")
-            print(f"Enformer:  test_pearson_r={model_r:.4f} test_r2={model_r2:.4f} (n={len(y_true)}), permutation p-value={model_perm_p:.4g}")
+            print("--- Enformer mu vs. cheap linear baseline ---")
+            print(f"Enformer:  test_pearson_r={model_r:.4f} test_r2={model_r2:.4f} (n={mu_eval.corr.n}), permutation p-value={mu_eval.permutation_p:.4g}")
             if baseline.get("skipped"):
                 print("Baseline:  skipped (constant pseudobulk target)")
             else:
@@ -615,12 +744,19 @@ def main() -> None:
                         "The Enformer model notably outperforms the cheap linear baseline -- more consistent with "
                         "the model using sequence context beyond a simple additive SNP effect."
                     )
-            predictions_summary = {
-                "model_test_pearson_r": float(model_r),
-                "model_test_r2": float(model_r2),
-                "model_permutation_p_value": model_perm_p,
-            }
             print()
+
+        predictions_summary = {
+            "mu_pearson_r": mu_eval.corr.pearson_r,
+            "mu_pearson_p": mu_eval.corr.pearson_p,
+            "mu_r2": mu_eval.corr.r2,
+            "mu_permutation_p": mu_eval.permutation_p,
+            "sigma_pearson_r": sigma_eval.corr.pearson_r,
+            "sigma_pearson_p": sigma_eval.corr.pearson_p,
+            "sigma_r2": sigma_eval.corr.r2,
+            "sigma_permutation_p": sigma_eval.permutation_p,
+            "n_test": int(mu_eval.corr.n),
+        }
 
     print("=== Summary / suggested interpretation ===")
     print(f"- n_donors used: {len(table.donor_ids)} (train={len(train_idx)} val={len(val_idx)} test={len(test_idx)})")
@@ -634,7 +770,14 @@ def main() -> None:
         else:
             print(f"- linear-eQTL baseline test R2: {baseline['test_r2']:.4f} (permutation p={perm_p:.4g})")
     if predictions_summary is not None:
-        print(f"- Enformer model test R2 (from --predictions-csv): {predictions_summary['model_test_r2']:.4f} (permutation p={predictions_summary['model_permutation_p_value']:.4g})")
+        print(
+            f"- Enformer mu test R2 (from --predictions-csv): {predictions_summary['mu_r2']:.4f} "
+            f"(permutation p={predictions_summary['mu_permutation_p']:.4g})"
+        )
+        print(
+            f"- Enformer sigma test R2 (from --predictions-csv): {predictions_summary['sigma_r2']:.4f} "
+            f"(permutation p={predictions_summary['sigma_permutation_p']:.4g})"
+        )
     print(
         "If the linear baseline alone explains most of the reported performance, if a single variant "
         "dominates, and/or if the test set is small (~20-30 donors), treat 'amazing' results with caution -- "
@@ -660,6 +803,8 @@ def main() -> None:
         }
         pd.Series(summary).to_json(os.path.join(args.out_dir, "diagnostics_summary.json"), indent=2)
         make_plots(args.out_dir, table, top_variants, dosage, positions, y, null_r2, observed_r2)
+        if pred_df is not None:
+            make_model_evaluation_plots(args.out_dir, pred_df, mu_eval, sigma_eval)
 
 
 if __name__ == "__main__":

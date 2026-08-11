@@ -181,10 +181,24 @@ It reports:
    set, to check whether the observed correlation exceeds chance given only `n_test` donors -- this
    matters a lot when `n_test` is ~20-30, which is common after an 85/15 split on OneK1K's ~500-900
    donors per cell type).
+6. **Model prediction-quality stats and plots for *both* heads**, if `--predictions-csv` is given:
+   Pearson r, Pearson p, R2, and the permutation p-value for `mu` (vs. true pseudobulk mean) *and*
+   separately for `sigma` (vs. true empirical cell-cell std) -- since the whole point of this POC
+   is `sigma`, not just `mu`. Printed with a short glossary of what each stat means:
+   - **Pearson r**: linear correlation between predicted and true values, -1..1.
+   - **Pearson p**: parametric significance of `r` (assumes bivariate normality); smaller = more
+     significant, but can be unreliable for small/non-normal `n`.
+   - **R2**: fraction of the true values' variance explained by the predictions; 1 = perfect,
+     0 = no better than always predicting the mean, <0 = worse than that.
+   - **permutation p**: the assumption-free version of Pearson p from point 5 above, applied to
+     `mu` and `sigma` individually.
 
-If `--out-dir` is given it also saves `diagnostics_summary.json`, `top_variants.csv`, and a
-4-panel `diagnostics.png` (pseudobulk histogram, `n_cells` confound scatter, top-variant scatter,
-and the permutation null distribution with the observed value marked).
+If `--out-dir` is given it also saves `diagnostics_summary.json`, `top_variants.csv`, a 4-panel
+`diagnostics.png` (pseudobulk histogram, `n_cells` confound scatter, top-variant scatter, and the
+baseline permutation null distribution with the observed value marked), and -- if
+`--predictions-csv` was given -- `model_predictions_vs_truth.png`: a 2-panel predicted-vs-true
+scatter plot (test set), one panel for `mu` and one for `sigma`, each with a `y = x` reference line
+and the Pearson r/p, R2, permutation-p stats annotated directly on the plot.
 
 As a sanity check that a *real* gene x cell-type effect, a *simple* large eQTL, and *pure noise*
 are all distinguishable, `src/diagnose.py` was validated against synthetic (random, unlinked to
@@ -229,6 +243,11 @@ biologically-meaningful training was not run. Instead, correctness was verified 
   sensible results (no false "significant" signal) on genotypes with no real relationship to
   expression. Also unit-tested `is_in_mhc_region` against real HLA-DRB5 and ACTB coordinates, and
   the ridge/permutation-test helpers against a synthetic case with a known linear relationship.
+- The `mu`/`sigma` model prediction-quality stats and `model_predictions_vs_truth.png` plot were
+  exercised against real `--predictions-csv` output from that same `--random-weights` run
+  (confirming both panels render and the annotated stats match a manual recomputation) and against
+  a synthetic predictions CSV with constant true values, confirming the "skipped (constant...)"
+  path is taken cleanly (nan stats, degraded-but-non-crashing plot) rather than raising.
 
 ## Out of scope for this POC
 
