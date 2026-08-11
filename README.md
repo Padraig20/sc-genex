@@ -125,7 +125,9 @@ Useful flags for constrained compute (no full fine-tune needed to sanity-check w
 Outputs land in `--out-dir`: `predictions_val_epoch{N}.csv` each eval epoch, `predictions_test_final.csv`
 at the end, and `best_model.pt` (the checkpoint with the best validation pseudobulk Pearson r). Each
 predictions CSV has one row per donor: `donor_id, y_true_pseudobulk_mean, y_true_empirical_std,
-y_pred_mu, y_pred_sigma, n_cells`.
+y_pred_mu, y_pred_sigma, n_cells`. Pass `--no-save-checkpoint` to skip writing `best_model.pt`
+(prediction CSVs are still saved) -- useful for quick/exploratory runs where you don't need the
+weights, e.g. when just checking whether a gene x cell-type pair is worth training for real.
 
 ## Diagnosing whether a result is "too easy"
 

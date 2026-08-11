@@ -125,6 +125,11 @@ def parse_args() -> argparse.Namespace:
     train_group.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     train_group.add_argument("--out-dir", default=None)
     train_group.add_argument("--wandb", action="store_true")
+    train_group.add_argument(
+        "--no-save-checkpoint",
+        action="store_true",
+        help="Skip writing best_model.pt to --out-dir (prediction CSVs are still saved). Useful for quick/repeated runs where the checkpoint itself isn't needed.",
+    )
 
     return parser.parse_args()
 
@@ -312,7 +317,10 @@ def main() -> None:
     logger.log(test_metrics)
     print("[test] " + " ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in test_metrics.items()))
 
-    torch.save(model.state_dict(), os.path.join(out_dir, "best_model.pt"))
+    if args.no_save_checkpoint:
+        print("[checkpoint] --no-save-checkpoint set, skipping best_model.pt")
+    else:
+        torch.save(model.state_dict(), os.path.join(out_dir, "best_model.pt"))
     logger.finish()
 
 
