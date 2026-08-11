@@ -211,8 +211,15 @@ def summarize_eval(df: pd.DataFrame, prefix: str) -> Dict[str, float]:
     sigma_corr = sigma_calibration_correlation(df["y_pred_sigma"].to_numpy(), df["y_true_empirical_std"].to_numpy())
     return {
         f"{prefix}/pseudobulk_pearson_r": mean_corr.pearson_r,
+        # Parametric p-value (assumes bivariate normality) for the pseudobulk
+        # correlation given only `n_donors` samples -- a quick, free sanity
+        # check on how surprising the reported correlation really is. See
+        # `src/diagnose.py` for a more robust, assumption-free permutation
+        # version of this same question, plus other "is this too easy?" checks.
+        f"{prefix}/pseudobulk_pearson_p": mean_corr.pearson_p,
         f"{prefix}/pseudobulk_r2": mean_corr.r2,
         f"{prefix}/sigma_calibration_pearson_r": sigma_corr.pearson_r,
+        f"{prefix}/sigma_calibration_pearson_p": sigma_corr.pearson_p,
         f"{prefix}/sigma_calibration_r2": sigma_corr.r2,
         f"{prefix}/n_donors": mean_corr.n,
     }

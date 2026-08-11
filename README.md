@@ -28,6 +28,7 @@ covers what you need to actually run this.
 | `src/metrics.py` | Pseudobulk Pearson r / R2, and the `sigma`-vs-empirical-std calibration correlation (the direct test of this POC's hypothesis). |
 | `src/wandb_logger.py` | Optional W&B logging; no-op by default so nothing requires a W&B login. |
 | `src/train.py` | CLI entrypoint tying everything together. |
+| `src/diagnose.py` | Standalone diagnostics for a (gene, cell-type) pair -- see "Diagnosing whether a result is 'too easy'" below. |
 
 ## How training works
 
@@ -126,6 +127,70 @@ at the end, and `best_model.pt` (the checkpoint with the best validation pseudob
 predictions CSV has one row per donor: `donor_id, y_true_pseudobulk_mean, y_true_empirical_std,
 y_pred_mu, y_pred_sigma, n_cells`.
 
+## Diagnosing whether a result is "too easy"
+
+A high pseudobulk Pearson r / R2 on the test set doesn't necessarily mean the model learned
+subtle regulatory grammar from sequence -- it can also mean the gene has one strong, well-tagged
+local eQTL (or even a structural presence/absence effect), or that the test set is small enough
+for a decent-looking correlation to arise partly by chance. `src/diagnose.py` runs a battery of
+checks for a given (gene, cell-type) pair to help distinguish these cases. It needs **no GPU and
+no Enformer** -- only the h5ad, VCFs, and GTF -- so it's cheap to run before or after a `train.py`
+run:
+
+```bash
+uv run python src/diagnose.py \
+  --gene ENSG00000198502 --cell-type "memory B cell" \
+  --h5ad-path data/onek1k_cellxgene_standardized.h5ad \
+  --vcf-dir /path/to/genotypes --gtf /path/to/gencode.gtf.gz \
+  --seq-len 49152 \
+  --predictions-csv results/ACTB_memoryBcell/predictions_test_final.csv \
+  --out-dir results/ACTB_memoryBcell/diagnostics
+```
+
+Pass the same `--seed`, `--min-cells-per-donor`, `--val-frac`, `--test-frac`, `--seq-len`, and VCF
+sample-ID options you used for the corresponding `train.py` run, so the donor split and genomic
+window line up; `--predictions-csv` is optional but lets it directly compare against your trained
+model's actual test predictions.
+
+It reports:
+
+1. **Expression-distribution diagnostics**: zero-inflation/dropout rate, skew, and -- importantly
+   -- whether `n_cells` per donor confounds the pseudobulk target (donors with very few cells get a
+   noisier *estimate* of cell-cell std purely from small-sample variance, unrelated to biology; this
+   shows up as a strong `n_cells` vs. `pseudobulk_std` correlation).
+2. **An MHC/HLA region flag.** Genes inside the classical MHC region (chr6:28.48-33.45Mb, GRCh38)
+   are known for unusually large, simple genetic effects on expression. The example gene from your
+   command, `ENSG00000198502`, is actually **HLA-DRB5** (chr6:32.5Mb) -- and HLA-DRB5 is a
+   textbook case: its presence in a person's genome is essentially tied to which `HLA-DRB1` haplotype
+   they carry (it's entirely absent on some common haplotypes), tagged by a long, high-LD block of
+   common SNPs. That's much closer to "classify a common haplotype" than "learn quantitative
+   regulatory grammar," so amazing results there are quite plausibly explained by this alone, not by
+   the sequence model learning something subtle.
+3. **Top individual variants** in the training window ranked by raw correlation with pseudobulk
+   expression -- a single variant with a large, significant correlation is itself a red flag for
+   "simple eQTL, not complex grammar."
+4. **A cheap linear-eQTL baseline**: ridge regression directly on raw SNP dosages in the same
+   TSS window used for training, evaluated on the identical train/val/test donor split. If this
+   baseline's test Pearson r/R2 is close to Enformer's (especially with `--predictions-csv` passed),
+   the deep sequence model likely isn't adding much beyond what a standard eQTL scan would find.
+5. **Permutation tests** (label-shuffling, not relying on any normality assumption): one for the
+   cheap baseline (shuffles training labels only, keeps the real test labels, to check whether the
+   observed test performance exceeds what could happen by chance given how few training donors and
+   how many variants there are), and one for your actual model's predictions if you pass
+   `--predictions-csv` (shuffles the pairing between predictions and true values on the fixed test
+   set, to check whether the observed correlation exceeds chance given only `n_test` donors -- this
+   matters a lot when `n_test` is ~20-30, which is common after an 85/15 split on OneK1K's ~500-900
+   donors per cell type).
+
+If `--out-dir` is given it also saves `diagnostics_summary.json`, `top_variants.csv`, and a
+4-panel `diagnostics.png` (pseudobulk histogram, `n_cells` confound scatter, top-variant scatter,
+and the permutation null distribution with the observed value marked).
+
+As a sanity check that a *real* gene x cell-type effect, a *simple* large eQTL, and *pure noise*
+are all distinguishable, `src/diagnose.py` was validated against synthetic (random, unlinked to
+expression) genotypes: the linear baseline and both permutation tests correctly reported no
+significant signal (p ~ 0.2-0.9), as expected when there's no true genotype-phenotype relationship.
+
 ## Testing performed
 
 Real VCFs/reference genome/GPU were not available in the development environment, so full
@@ -147,6 +212,13 @@ biologically-meaningful training was not run. Instead, correctness was verified 
   `OneK1K_{Y}`-style sample IDs (not identical to the h5ad `donor_id`), confirming the default
   `--vcf-sample-id-scheme onek1k` mapping resolves donors correctly with no explicit
   `--donor-id-map` needed, and that mismatched IDs fail loudly (`KeyError`) rather than silently.
+- A full end-to-end run of `src/diagnose.py` against the same real-h5ad + synthetic-genome/VCF
+  setup, including the `--predictions-csv` comparison path fed from a `--random-weights` `train.py`
+  run: confirmed all sections (distribution stats, MHC flag, top variants, ridge baseline,
+  both permutation tests, plots/JSON/CSV output) execute correctly and report statistically
+  sensible results (no false "significant" signal) on genotypes with no real relationship to
+  expression. Also unit-tested `is_in_mhc_region` against real HLA-DRB5 and ACTB coordinates, and
+  the ridge/permutation-test helpers against a synthetic case with a known linear relationship.
 
 ## Out of scope for this POC
 

@@ -8,6 +8,7 @@ dependencies = [
     "anndata>=0.13.2",
     "enformer-pytorch>=0.8.12",
     "h5py>=3.16.0",
+    "matplotlib>=3.11.1",
     "numpy>=2.5.2",
     "pandas>=3.0.5",
     "pysam>=0.24.0",

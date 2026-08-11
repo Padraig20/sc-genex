@@ -27,7 +27,8 @@ class CorrelationResult:
     n: int
 
 
-def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Coefficient of determination: 1 - SS_res / SS_tot."""
     ss_res = np.sum((y_true - y_pred) ** 2)
     ss_tot = np.sum((y_true - y_true.mean()) ** 2)
     if ss_tot == 0:
@@ -41,7 +42,7 @@ def _correlation(y_true: np.ndarray, y_pred: np.ndarray) -> CorrelationResult:
     if len(y_true) < 2:
         return CorrelationResult(pearson_r=float("nan"), pearson_p=float("nan"), r2=float("nan"), n=len(y_true))
     r, p = pearsonr(y_true, y_pred)
-    return CorrelationResult(pearson_r=float(r), pearson_p=float(p), r2=_r2_score(y_true, y_pred), n=len(y_true))
+    return CorrelationResult(pearson_r=float(r), pearson_p=float(p), r2=r2_score(y_true, y_pred), n=len(y_true))
 
 
 def pseudobulk_correlation(pred_mu: np.ndarray, true_pseudobulk_mean: np.ndarray) -> CorrelationResult:

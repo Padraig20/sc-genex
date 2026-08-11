@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from bisect import bisect_left
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -225,6 +225,62 @@ class VCFGenotypeReader:
             pos_0based = record.pos - 1  # VCF POS is 1-based
             out[pos_0based] = (ref.upper(), alt.upper(), dosage)
         return out
+
+    def get_dosage_matrix_in_region(
+        self, chrom: str, start: int, end: int, sample_ids: Sequence[str]
+    ) -> Tuple[List[int], List[Tuple[str, str]], "np.ndarray"]:
+        """Fetches all biallelic SNPs in [start, end) once and reads dosage for many samples.
+
+        Unlike `get_dosages_in_region` (single sample, used by
+        `build_personalized_onehot`), this reads each VCF record only once and
+        extracts every requested sample's genotype from it -- meant for
+        diagnostics/baselines that need a full donor x variant dosage matrix
+        (see `src/diagnose.py`), where calling `get_dosages_in_region` once per
+        sample would re-scan the region redundantly.
+
+        Returns:
+            positions: 0-based variant positions, in VCF order.
+            ref_alt: (ref, alt) per variant, same order as `positions`.
+            dosage: [len(sample_ids), n_variants] float32 array; NaN for
+                missing/multi-allelic/indel-skipped genotypes.
+        """
+        vcf = self._get_vcf(chrom)
+        missing_samples = [s for s in sample_ids if s not in vcf.header.samples]
+        if missing_samples:
+            preview = missing_samples[:5]
+            suffix = "..." if len(missing_samples) > 5 else ""
+            raise KeyError(
+                f"{len(missing_samples)} sample(s) not found in VCF for chromosome '{chrom}': {preview}{suffix}"
+            )
+
+        positions: List[int] = []
+        ref_alt: List[Tuple[str, str]] = []
+        dosage_columns: List[np.ndarray] = []
+        for record in vcf.fetch(chrom, max(start, 0), end):
+            ref = record.ref
+            alts = record.alts
+            if ref is None or alts is None or len(alts) != 1:
+                continue  # skip multi-allelic sites for this POC
+            alt = alts[0]
+            if len(ref) != 1 or len(alt) != 1:
+                continue  # SNPs only, no indels
+
+            column = np.full(len(sample_ids), np.nan, dtype=np.float32)
+            for i, sample_id in enumerate(sample_ids):
+                genotype = record.samples[sample_id].get("GT")
+                if genotype is None or any(allele is None for allele in genotype):
+                    continue
+                column[i] = sum(1 for allele in genotype if allele == 1)
+
+            positions.append(record.pos - 1)
+            ref_alt.append((ref.upper(), alt.upper()))
+            dosage_columns.append(column)
+
+        if not dosage_columns:
+            return [], [], np.zeros((len(sample_ids), 0), dtype=np.float32)
+
+        dosage = np.stack(dosage_columns, axis=1)  # [n_samples, n_variants]
+        return positions, ref_alt, dosage
 
     def close(self) -> None:
         for vcf in self._open_files.values():
