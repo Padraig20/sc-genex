@@ -39,10 +39,20 @@ def r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def _correlation(y_true: np.ndarray, y_pred: np.ndarray) -> CorrelationResult:
     mask = ~(np.isnan(y_true) | np.isnan(y_pred))
     y_true, y_pred = y_true[mask], y_pred[mask]
-    if len(y_true) < 2:
-        return CorrelationResult(pearson_r=float("nan"), pearson_p=float("nan"), r2=float("nan"), n=len(y_true))
+    n = len(y_true)
+    if n < 2:
+        return CorrelationResult(pearson_r=float("nan"), pearson_p=float("nan"), r2=float("nan"), n=n)
+    if np.std(y_true) == 0 or np.std(y_pred) == 0:
+        # Pearson correlation is undefined when either side is constant --
+        # e.g. every donor has the same pseudobulk target (small/degenerate
+        # eval set), or -- for sigma calibration -- every donor has exactly 1
+        # cell so empirical std is 0 for all of them. Skip rather than let
+        # scipy raise a ConstantInputWarning and return nan; R2 is still
+        # well-defined unless `y_true` itself is constant (handled inside
+        # `r2_score`), so it's still computed.
+        return CorrelationResult(pearson_r=float("nan"), pearson_p=float("nan"), r2=r2_score(y_true, y_pred), n=n)
     r, p = pearsonr(y_true, y_pred)
-    return CorrelationResult(pearson_r=float(r), pearson_p=float(p), r2=r2_score(y_true, y_pred), n=len(y_true))
+    return CorrelationResult(pearson_r=float(r), pearson_p=float(p), r2=r2_score(y_true, y_pred), n=n)
 
 
 def pseudobulk_correlation(pred_mu: np.ndarray, true_pseudobulk_mean: np.ndarray) -> CorrelationResult:

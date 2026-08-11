@@ -70,6 +70,32 @@ from src.metrics import r2_score
 MHC_REGION_GRCH38 = {"chrom": "6", "start": 28_477_797, "end": 33_448_354}
 
 
+def is_constant(values: np.ndarray, atol: float = 1e-12) -> bool:
+    """True if `values` has (numerically) zero variance.
+
+    This is a real scenario here, not just an edge case: e.g. a gene with no
+    detected expression at all in a cell type, or a cell type where almost
+    every donor has exactly 1 cell (so empirical std is 0 for all of them).
+    Correlation is undefined in that case, and several downstream
+    computations (ridge target-centering, permutation nulls) become
+    ill-posed or silently misleading rather than erroring, so this is checked
+    explicitly everywhere it matters instead of relying on NaN propagation.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    values = values[~np.isnan(values)]
+    if len(values) == 0:
+        return True
+    return bool(np.std(values) <= atol)
+
+
+def safe_pearsonr(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
+    """`pearsonr`, but returns (nan, nan) for constant/too-short input instead of warning."""
+    if len(a) < 3 or is_constant(a) or is_constant(b):
+        return float("nan"), float("nan")
+    r, p = pearsonr(a, b)
+    return float(r), float(p)
+
+
 # --------------------------------------------------------------------------- #
 # Expression-distribution diagnostics
 # --------------------------------------------------------------------------- #
@@ -100,7 +126,7 @@ def summarize_distribution(values: np.ndarray, near_zero_threshold: float = 0.05
         median=float(np.median(values)),
         std=std,
         cv=(std / mean) if mean != 0 else float("nan"),
-        skewness=float(skew(values)) if len(values) > 2 else float("nan"),
+        skewness=float(skew(values)) if len(values) > 2 and std > 0 else float("nan"),
         min=float(values.min()),
         max=float(values.max()),
         p10=float(np.percentile(values, 10)),
@@ -123,14 +149,8 @@ def n_cells_confound_check(table: DonorTable) -> Dict[str, float]:
     pb_std = np.array([table.pseudobulk_std[d] for d in donor_ids], dtype=np.float64)
     pb_mean = np.array([table.pseudobulk_mean[d] for d in donor_ids], dtype=np.float64)
 
-    def safe_corr(a, b):
-        if len(a) > 2 and np.std(a) > 0 and np.std(b) > 0:
-            r, p = pearsonr(a, b)
-            return float(r), float(p)
-        return float("nan"), float("nan")
-
-    r_std, p_std = safe_corr(n_cells, pb_std)
-    r_mean, p_mean = safe_corr(n_cells, pb_mean)
+    r_std, p_std = safe_pearsonr(n_cells, pb_std)
+    r_mean, p_mean = safe_pearsonr(n_cells, pb_mean)
     return {
         "n_donors": len(donor_ids),
         "n_cells_median": float(np.median(n_cells)),
@@ -211,10 +231,13 @@ def impute_and_filter_dosage(
 def top_variant_correlations(
     dosage: np.ndarray, positions: List[int], ref_alt: List[Tuple[str, str]], allele_freq: np.ndarray, y: np.ndarray, top_k: int = 10
 ) -> pd.DataFrame:
+    if is_constant(y):
+        # Nothing for any variant to explain -- avoid a ConstantInputWarning per variant.
+        return pd.DataFrame()
     rows = []
     for j in range(dosage.shape[1]):
         col = dosage[:, j]
-        if np.std(col) == 0:
+        if is_constant(col):
             continue
         r, p = pearsonr(col, y)
         rows.append(
@@ -242,21 +265,31 @@ def fit_eqtl_baseline(
     alphas: Sequence[float],
 ) -> Dict:
     """Fits the ridge baseline (selecting alpha on val, or train if val is tiny) and evaluates on test."""
+    if is_constant(y[train_idx]):
+        return {
+            "skipped": True,
+            "reason": "training-set pseudobulk targets are constant across donors -- nothing for a linear model to predict",
+        }
+
     best_alpha, best_val_r2, best_model = alphas[0], -np.inf, None
     for alpha in alphas:
         model = RidgeBaseline(alpha).fit(dosage[train_idx], y[train_idx])
         eval_idx = val_idx if len(val_idx) >= 3 else train_idx
         val_r2 = r2_score(y[eval_idx], model.predict(dosage[eval_idx]))
-        if not np.isnan(val_r2) and val_r2 > best_val_r2:
+        # val_r2 can be NaN if the val (or fallback train) slice happens to be
+        # constant -- fall back to keeping the first alpha's model rather
+        # than leaving `best_model` unset (every alpha would look equally
+        # "unselectable" in that case, so any choice is as good as another).
+        if best_model is None or (not np.isnan(val_r2) and val_r2 > best_val_r2):
             best_alpha, best_val_r2, best_model = alpha, val_r2, model
 
     test_pred = best_model.predict(dosage[test_idx])
-    r, p = (pearsonr(y[test_idx], test_pred) if len(test_idx) > 2 else (float("nan"), float("nan")))
+    r, p = safe_pearsonr(y[test_idx], test_pred)
     return {
         "best_alpha": best_alpha,
         "selection_val_r2": best_val_r2,
-        "test_pearson_r": float(r),
-        "test_pearson_p": float(p),
+        "test_pearson_r": r,
+        "test_pearson_p": p,
         "test_r2": r2_score(y[test_idx], test_pred),
         "test_pred": test_pred,
         "model": best_model,
@@ -282,7 +315,16 @@ def permutation_test_baseline(
     donors and this many variants achieve this test-set performance by chance alone,
     with no real genotype-phenotype relationship? Important because ridge with many
     variants and few donors can overfit and "explain" noise.
+
+    Returns (nan, empty array, nan) if either the train or test targets are
+    constant -- there is nothing for the model to fit, or nothing to
+    evaluate against, so R2 is undefined and a p-value would be meaningless
+    (comparisons against NaN silently evaluate to False, which would
+    otherwise produce a spuriously "significant" p-value of 0.0).
     """
+    if is_constant(y[train_idx]) or is_constant(y[test_idx]):
+        return float("nan"), np.array([]), float("nan")
+
     observed_model = RidgeBaseline(alpha).fit(dosage[train_idx], y[train_idx])
     observed_r2 = r2_score(y[test_idx], observed_model.predict(dosage[test_idx]))
 
@@ -306,7 +348,15 @@ def permutation_test_predictions(
     `predictions_test_final.csv` from `train.py`. Complements the parametric
     p-value already reported by `train.py`/`src/metrics.py` (which assumes
     bivariate normality) with an assumption-free version.
+
+    Returns (nan, empty array, nan) if either side is constant -- e.g. every
+    test donor happens to share the same true pseudobulk mean, or the model
+    predicted a constant `mu` -- since correlation (and re-pairing it
+    `n_permutations` times) is undefined/meaningless in that case.
     """
+    if is_constant(y_true) or is_constant(y_pred):
+        return float("nan"), np.array([]), float("nan")
+
     observed_r, _ = pearsonr(y_true, y_pred)
     null_r = np.empty(n_permutations)
     for i in range(n_permutations):
@@ -392,10 +442,14 @@ def make_plots(out_dir: str, table: DonorTable, top_variants: pd.DataFrame, dosa
     else:
         axes[1, 0].axis("off")
 
-    axes[1, 1].hist(baseline_null, bins=40, alpha=0.7, label="permutation null")
-    axes[1, 1].axvline(baseline_observed, color="red", label="observed")
-    axes[1, 1].set_title("Linear-baseline permutation test (test R2)")
-    axes[1, 1].legend()
+    if len(baseline_null) > 0 and not np.isnan(baseline_observed):
+        axes[1, 1].hist(baseline_null, bins=40, alpha=0.7, label="permutation null")
+        axes[1, 1].axvline(baseline_observed, color="red", label="observed")
+        axes[1, 1].set_title("Linear-baseline permutation test (test R2)")
+        axes[1, 1].legend()
+    else:
+        axes[1, 1].axis("off")
+        axes[1, 1].text(0.5, 0.5, "permutation test skipped\n(constant target)", ha="center", va="center")
 
     fig.tight_layout()
     os.makedirs(out_dir, exist_ok=True)
@@ -473,15 +527,25 @@ def main() -> None:
         print("[!] No usable variants in this window -- cannot run the linear-eQTL baseline or permutation tests.")
         return
 
-    top_variants = top_variant_correlations(dosage, positions, ref_alt, allele_freq, y, top_k=args.top_k_variants)
-    print(f"--- Top {len(top_variants)} variants by |correlation| with pseudobulk expression ---")
-    print(top_variants.to_string(index=False))
-    if len(top_variants) > 0 and top_variants.iloc[0]["pearson_p"] < 1e-4 and abs(top_variants.iloc[0]["pearson_r"]) > 0.5:
+    targets_are_constant = is_constant(y)
+    if targets_are_constant:
         print(
-            "[!] A single variant already strongly correlates with expression -- this looks like a "
-            "simple, large-effect eQTL rather than something requiring learned sequence context."
+            "[!] Pseudobulk targets are constant across all donors for this (gene, cell-type) -- there is "
+            "nothing for any variant or linear model to explain. Skipping top-variant correlations, the "
+            "linear-eQTL baseline, and both permutation tests (all undefined for a constant target)."
         )
-    print()
+        print()
+
+    top_variants = top_variant_correlations(dosage, positions, ref_alt, allele_freq, y, top_k=args.top_k_variants)
+    if not targets_are_constant:
+        print(f"--- Top {len(top_variants)} variants by |correlation| with pseudobulk expression ---")
+        print(top_variants.to_string(index=False))
+        if len(top_variants) > 0 and top_variants.iloc[0]["pearson_p"] < 1e-4 and abs(top_variants.iloc[0]["pearson_r"]) > 0.5:
+            print(
+                "[!] A single variant already strongly correlates with expression -- this looks like a "
+                "simple, large-effect eQTL rather than something requiring learned sequence context."
+            )
+        print()
 
     split = split_donors(table.donor_ids, val_frac=args.val_frac, test_frac=args.test_frac, seed=args.seed)
     donor_to_row = {d: i for i, d in enumerate(table.donor_ids)}
@@ -489,59 +553,86 @@ def main() -> None:
     val_idx = np.array([donor_to_row[d] for d in split.val])
     test_idx = np.array([donor_to_row[d] for d in split.test])
 
-    baseline = fit_eqtl_baseline(dosage, y, train_idx, val_idx, test_idx, args.alphas)
-    print("--- Cheap linear-eQTL baseline (ridge on raw SNP dosages, same donor split) ---")
-    print(
-        f"best_alpha={baseline['best_alpha']} test_pearson_r={baseline['test_pearson_r']:.4f} "
-        f"test_pearson_p={baseline['test_pearson_p']:.4g} test_r2={baseline['test_r2']:.4f} (n_test={len(test_idx)})"
-    )
-    print()
+    if targets_are_constant:
+        baseline = {"skipped": True, "reason": "pseudobulk targets are constant across all donors"}
+        observed_r2, null_r2, perm_p = float("nan"), np.array([]), float("nan")
+    else:
+        baseline = fit_eqtl_baseline(dosage, y, train_idx, val_idx, test_idx, args.alphas)
+        if baseline.get("skipped"):
+            print(f"--- Cheap linear-eQTL baseline: skipped ({baseline['reason']}) ---\n")
+            observed_r2, null_r2, perm_p = float("nan"), np.array([]), float("nan")
+        else:
+            print("--- Cheap linear-eQTL baseline (ridge on raw SNP dosages, same donor split) ---")
+            print(
+                f"best_alpha={baseline['best_alpha']} test_pearson_r={baseline['test_pearson_r']:.4f} "
+                f"test_pearson_p={baseline['test_pearson_p']:.4g} test_r2={baseline['test_r2']:.4f} (n_test={len(test_idx)})"
+            )
+            print()
 
-    observed_r2, null_r2, perm_p = permutation_test_baseline(
-        dosage, y, train_idx, test_idx, baseline["best_alpha"], args.n_permutations, rng
-    )
-    print("--- Permutation test: linear baseline vs. train-label-shuffled null ---")
-    print(
-        f"observed test R2={observed_r2:.4f}, null mean={null_r2.mean():.4f} +/- {null_r2.std():.4f}, "
-        f"empirical p-value={perm_p:.4g} (n_permutations={args.n_permutations})"
-    )
-    print()
+            observed_r2, null_r2, perm_p = permutation_test_baseline(
+                dosage, y, train_idx, test_idx, baseline["best_alpha"], args.n_permutations, rng
+            )
+            if np.isnan(perm_p):
+                print("--- Permutation test: linear baseline vs. train-label-shuffled null: skipped (constant target in train or test) ---\n")
+            else:
+                print("--- Permutation test: linear baseline vs. train-label-shuffled null ---")
+                print(
+                    f"observed test R2={observed_r2:.4f}, null mean={null_r2.mean():.4f} +/- {null_r2.std():.4f}, "
+                    f"empirical p-value={perm_p:.4g} (n_permutations={args.n_permutations})"
+                )
+                print()
 
     predictions_summary = None
     if args.predictions_csv is not None:
         pred_df = pd.read_csv(args.predictions_csv)
         y_true = pred_df["y_true_pseudobulk_mean"].to_numpy()
         y_pred = pred_df["y_pred_mu"].to_numpy()
-        model_r, _ = pearsonr(y_true, y_pred)
-        model_r2 = r2_score(y_true, y_pred)
-        obs_r, null_r, model_perm_p = permutation_test_predictions(y_true, y_pred, args.n_permutations, rng)
 
-        print("--- Enformer model vs. cheap linear baseline ---")
-        print(f"Enformer:  test_pearson_r={model_r:.4f} test_r2={model_r2:.4f} (n={len(y_true)}), permutation p-value={model_perm_p:.4g}")
-        print(f"Baseline:  test_pearson_r={baseline['test_pearson_r']:.4f} test_r2={baseline['test_r2']:.4f} (n={len(test_idx)})")
-        if abs(model_r) - abs(baseline["test_pearson_r"]) < 0.1:
+        if is_constant(y_true) or is_constant(y_pred):
             print(
-                "[!] The cheap linear SNP baseline is within ~0.1 Pearson r of the Enformer model. This "
-                "suggests the task may reduce to standard eQTL detection (a few strongly-tagging variants), "
-                "and the deep sequence model may not be learning much beyond that."
+                "--- Enformer model vs. cheap linear baseline: skipped (constant true value or prediction "
+                "in --predictions-csv) ---\n"
             )
         else:
-            print(
-                "The Enformer model notably outperforms the cheap linear baseline -- more consistent with the "
-                "model using sequence context beyond a simple additive SNP effect."
-            )
-        predictions_summary = {
-            "model_test_pearson_r": float(model_r),
-            "model_test_r2": float(model_r2),
-            "model_permutation_p_value": model_perm_p,
-        }
-        print()
+            model_r, _ = safe_pearsonr(y_true, y_pred)
+            model_r2 = r2_score(y_true, y_pred)
+            _, _, model_perm_p = permutation_test_predictions(y_true, y_pred, args.n_permutations, rng)
+
+            print("--- Enformer model vs. cheap linear baseline ---")
+            print(f"Enformer:  test_pearson_r={model_r:.4f} test_r2={model_r2:.4f} (n={len(y_true)}), permutation p-value={model_perm_p:.4g}")
+            if baseline.get("skipped"):
+                print("Baseline:  skipped (constant pseudobulk target)")
+            else:
+                print(f"Baseline:  test_pearson_r={baseline['test_pearson_r']:.4f} test_r2={baseline['test_r2']:.4f} (n={len(test_idx)})")
+                if abs(model_r) - abs(baseline["test_pearson_r"]) < 0.1:
+                    print(
+                        "[!] The cheap linear SNP baseline is within ~0.1 Pearson r of the Enformer model. This "
+                        "suggests the task may reduce to standard eQTL detection (a few strongly-tagging variants), "
+                        "and the deep sequence model may not be learning much beyond that."
+                    )
+                else:
+                    print(
+                        "The Enformer model notably outperforms the cheap linear baseline -- more consistent with "
+                        "the model using sequence context beyond a simple additive SNP effect."
+                    )
+            predictions_summary = {
+                "model_test_pearson_r": float(model_r),
+                "model_test_r2": float(model_r2),
+                "model_permutation_p_value": model_perm_p,
+            }
+            print()
 
     print("=== Summary / suggested interpretation ===")
     print(f"- n_donors used: {len(table.donor_ids)} (train={len(train_idx)} val={len(val_idx)} test={len(test_idx)})")
     print(f"- in MHC/HLA region: {is_in_mhc_region(gene_record)}")
-    print(f"- top single-variant |r|: {top_variants['pearson_r'].abs().max():.4f}" if len(top_variants) > 0 else "- no usable variants")
-    print(f"- linear-eQTL baseline test R2: {baseline['test_r2']:.4f} (permutation p={perm_p:.4g})")
+    if targets_are_constant:
+        print("- pseudobulk targets are constant across donors -- eQTL/baseline diagnostics skipped entirely")
+    else:
+        print(f"- top single-variant |r|: {top_variants['pearson_r'].abs().max():.4f}" if len(top_variants) > 0 else "- no usable variants")
+        if baseline.get("skipped"):
+            print(f"- linear-eQTL baseline: skipped ({baseline['reason']})")
+        else:
+            print(f"- linear-eQTL baseline test R2: {baseline['test_r2']:.4f} (permutation p={perm_p:.4g})")
     if predictions_summary is not None:
         print(f"- Enformer model test R2 (from --predictions-csv): {predictions_summary['model_test_r2']:.4f} (permutation p={predictions_summary['model_permutation_p_value']:.4g})")
     print(
@@ -561,6 +652,7 @@ def main() -> None:
             "pseudobulk_std_distribution": asdict(pb_std_summary),
             "n_cells_confound": confound,
             "in_mhc_region": is_in_mhc_region(gene_record),
+            "targets_are_constant": targets_are_constant,
             "n_variants_in_window": int(dosage.shape[1]),
             "baseline": {k: v for k, v in baseline.items() if k not in ("test_pred", "model")},
             "baseline_permutation_p_value": perm_p,

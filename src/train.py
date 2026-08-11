@@ -207,8 +207,18 @@ def run_pseudobulk_eval(model: VariformerGNLL, dataset: PseudobulkEvalDataset, d
 
 
 def summarize_eval(df: pd.DataFrame, prefix: str) -> Dict[str, float]:
-    mean_corr = pseudobulk_correlation(df["y_pred_mu"].to_numpy(), df["y_true_pseudobulk_mean"].to_numpy())
-    sigma_corr = sigma_calibration_correlation(df["y_pred_sigma"].to_numpy(), df["y_true_empirical_std"].to_numpy())
+    true_mean = df["y_true_pseudobulk_mean"].to_numpy()
+    true_std = df["y_true_empirical_std"].to_numpy()
+    if np.std(true_mean) == 0:
+        print(f"[{prefix}] note: pseudobulk targets are constant across donors -- pseudobulk correlation is undefined, skipping (nan)")
+    if np.std(true_std) == 0:
+        print(
+            f"[{prefix}] note: empirical-std targets are constant across donors (e.g. every donor has ~1 cell) "
+            "-- sigma-calibration correlation is undefined, skipping (nan)"
+        )
+
+    mean_corr = pseudobulk_correlation(df["y_pred_mu"].to_numpy(), true_mean)
+    sigma_corr = sigma_calibration_correlation(df["y_pred_sigma"].to_numpy(), true_std)
     return {
         f"{prefix}/pseudobulk_pearson_r": mean_corr.pearson_r,
         # Parametric p-value (assumes bivariate normality) for the pseudobulk

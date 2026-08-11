@@ -191,6 +191,16 @@ are all distinguishable, `src/diagnose.py` was validated against synthetic (rand
 expression) genotypes: the linear baseline and both permutation tests correctly reported no
 significant signal (p ~ 0.2-0.9), as expected when there's no true genotype-phenotype relationship.
 
+**Constant targets are handled explicitly, not as a crash.** Pseudobulk targets (or empirical
+stds) can legitimately be constant across donors -- e.g. an undetected gene, or a cell type where
+almost every donor has only 1 cell of that type (so empirical std is 0 everywhere). Pearson
+correlation, R2, skewness, and ridge-target-centering are all undefined or ill-posed in that case.
+Both `src/train.py` (via `src/metrics.py`) and `src/diagnose.py` detect this up front (`np.std(...)
+== 0`, not just relying on NaN propagation) and print an explicit "skipping" note instead of
+raising, warning noisily (especially inside the `n_permutations`-iteration loops), or -- in one
+case in `src/diagnose.py`'s ridge alpha-selection -- crashing outright when every candidate's
+validation R2 came back `NaN`.
+
 ## Testing performed
 
 Real VCFs/reference genome/GPU were not available in the development environment, so full
