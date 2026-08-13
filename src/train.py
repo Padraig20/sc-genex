@@ -189,26 +189,39 @@ def build_pipeline(args: argparse.Namespace):
 
     compute_population_means(table, donor_split.train)
 
-    reference = ReferenceGenome(args.genome_fasta)
-    vcf_reader = VCFGenotypeReader(args.vcf_dir, filename_template=args.vcf_filename_template)
     donor_id_map = load_donor_id_map(args.donor_id_map)
     if args.vcf_sample_id_scheme == "onek1k":
         sample_id_fn = lambda d: onek1k_sample_id_from_donor_id(d, prefix=args.vcf_sample_id_prefix)  # noqa: E731
     else:
         sample_id_fn = lambda d: d  # noqa: E731
 
-    sequence_builder = PersonalGenomeSequenceBuilder(
-        reference=reference,
-        vcf_reader=vcf_reader,
-        genes=gene_records,
-        seq_len=args.seq_len,
-        vcf_chrom_style=args.vcf_chrom_style,
-        donor_id_to_sample_id=donor_id_map,
-        sample_id_fn=sample_id_fn,
-        strict_phasing=args.strict_phasing,
-    )
+    def _make_sequence_builder() -> PersonalGenomeSequenceBuilder:
+        # A fresh ReferenceGenome/VCFGenotypeReader per builder -- NOT shared between the
+        # training builder (below) and the eval builder. `pysam` file handles must never be
+        # shared across a `fork()`: the training DataLoader workers are (re)forked every epoch
+        # (no `persistent_workers`), and if the *main* process had already opened VCF handles
+        # on the same reader (e.g. from an eval pass), those handles would get duplicated into
+        # every worker, sharing the same underlying kernel file offset -- concurrent tabix
+        # reads across those forked siblings then race and corrupt each other's bgzf stream
+        # (surfaces as "CRC32 checksum mismatch" / "truncated file" from pysam/htslib).
+        # Keeping the training-path reader untouched by the (single-process) eval path means
+        # its `_open_files` is always empty at fork time, so every worker always opens its own
+        # independent, unshared file descriptors.
+        return PersonalGenomeSequenceBuilder(
+            reference=ReferenceGenome(args.genome_fasta),
+            vcf_reader=VCFGenotypeReader(args.vcf_dir, filename_template=args.vcf_filename_template),
+            genes=gene_records,
+            seq_len=args.seq_len,
+            vcf_chrom_style=args.vcf_chrom_style,
+            donor_id_to_sample_id=donor_id_map,
+            sample_id_fn=sample_id_fn,
+            strict_phasing=args.strict_phasing,
+        )
 
-    train_ds = PersonalGenomeDatasetSC(gene_split.train, donor_split.train, table, sequence_builder)
+    train_sequence_builder = _make_sequence_builder()
+    eval_sequence_builder = _make_sequence_builder()
+
+    train_ds = PersonalGenomeDatasetSC(gene_split.train, donor_split.train, table, train_sequence_builder)
     print(f"[data] train pairs (train genes x train donors): {len(train_ds)}")
 
     eval_gene_donor_lists = {
@@ -221,7 +234,7 @@ def build_pipeline(args: argparse.Namespace):
     eval_datasets = {}
     for name, (genes, donors) in eval_gene_donor_lists.items():
         eval_datasets[name] = PersonalGenomeEvalDataset(
-            genes, donors, table, sequence_builder, max_pairs=args.max_eval_pairs, seed=args.seed
+            genes, donors, table, eval_sequence_builder, max_pairs=args.max_eval_pairs, seed=args.seed
         )
         print(f"[data] eval set '{name}': {len(eval_datasets[name])} pairs")
 
@@ -394,6 +407,10 @@ def main() -> None:
                 best_metric = monitor
                 best_state = copy.deepcopy(model.state_dict())
                 epochs_without_improvement = 0
+                if not args.no_save_checkpoint:
+                    # Persisted immediately (not just at the end) so a crash/OOM/preemption
+                    # later in a long run doesn't lose an already-improved checkpoint.
+                    torch.save(best_state, os.path.join(out_dir, "best_model.pt"))
             else:
                 epochs_without_improvement += 1
             epoch_bar.set_postfix(val_r=f"{monitor:.4f}", best=f"{best_metric:.4f}", no_improve=epochs_without_improvement)
