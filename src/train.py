@@ -1,33 +1,29 @@
-"""Trains a Variformer-style, single-cell, Gaussian-NLL model for one (gene,
-cell_type) pair on OneK1K.
+"""Trains `PSAGEnetSC` -- a from-scratch, pSAGE-net-inspired compact CNN --
+on single-cell OneK1K expression for one cell type, across the top-N
+heritability-ranked genes (see `scripts/run_heritability_ranking.py`).
 
-Faithful to Variformer (https://github.com/shirondru/enformer_fine_tuning)
-in spirit: personalized, TSS-centered DNA input per donor fine-tunes a
-pretrained Enformer. Two POC-specific changes:
-  1. Training targets are per-cell (not pseudobulked) expression values --
-     see `src/loss.py` for how this is made computationally efficient while
-     remaining mathematically equivalent to per-cell training.
-  2. The loss is a Gaussian NLL over a learned (mu, sigma) pair per donor,
-     instead of MSE over a single value, so the model also learns to predict
-     cell-cell variability (a proxy for expression specificity).
-
-Validation/test are always pseudobulk (per-donor mean), per the plan.
+Training is per-cell (no pseudobulking): every `(gene, donor)` example is
+scored against every one of that donor's actual per-cell expression values
+via a per-cell-weighted Gaussian NLL on the difference head (`src/loss.py`).
+Evaluation is always pseudobulk (per-donor mean/std), across all 4 cells of
+the seen/unseen-gene x seen/unseen-individual matrix (`src/metrics.py`).
 
 Example:
     python src/train.py \\
-        --gene ENSG00000075624 --cell-type "naive B cell" \\
         --h5ad-path data/onek1k_cellxgene_standardized.h5ad \\
-        --vcf-dir /path/to/genotypes --genome-fasta /path/to/hg38.fa \\
-        --gtf /path/to/annotation.gtf.gz --out-dir results/ACTB_naiveB
+        --cell-type "naive B cell" \\
+        --top-genes-csv results/heritability/naive_B_cell/top_1000_genes.csv \\
+        --vcf-dir /path/to/genotypes --genome-fasta /path/to/hg38.fa --gtf /path/to/gencode.gtf.gz \\
+        --out-dir results/naive_B_cell_psagenet_sc
 """
 from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import random
 import sys
-from dataclasses import asdict
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -39,18 +35,26 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from data.preprocess import prepare_gene_celltype_data
+from data.preprocess import build_multigene_donor_table, compute_population_means, get_celltype_donor_ids, load_celltype_multigene_cells
 from src.dataset import (
-    DonorSequenceBuilder,
-    PseudobulkEvalDataset,
-    SingleCellDonorDataset,
-    collate_donor_batch,
+    PersonalGenomeDatasetSC,
+    PersonalGenomeEvalDataset,
+    PersonalGenomeSequenceBuilder,
+    collate_eval_batch,
+    collate_personal_genome_batch,
 )
 from src.genome import GeneAnnotation, ReferenceGenome, VCFGenotypeReader, onek1k_sample_id_from_donor_id
-from src.loss import per_cell_gaussian_nll
-from src.metrics import pseudobulk_correlation, sigma_calibration_correlation
-from src.model import VariformerGNLL
+from src.loss import psagenet_sc_loss
+from src.metrics import grouped_correlation
+from src.model import PSAGEnetSC
+from src.splits import DonorSplit, GeneSplit, split_donors, split_genes_by_chromosome
 from src.wandb_logger import get_logger
+
+# The 4 held-out cells of the seen/unseen-gene x seen/unseen-individual matrix
+# (see plan); "seen_gene_val_donor" is a 5th, training-time-only cell used for
+# early stopping (mirrors the paper's model-selection criterion) and is not
+# part of the final reported matrix.
+EVAL_MATRIX_CELLS = ("seen_gene_seen_donor", "seen_gene_unseen_donor", "unseen_gene_seen_donor", "unseen_gene_unseen_donor")
 
 
 def set_seed(seed: int) -> None:
@@ -64,72 +68,78 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
     data_group = parser.add_argument_group("data")
-    data_group.add_argument("--gene", required=True, help="Ensembl gene ID (preferred) or gene symbol")
-    data_group.add_argument("--cell-type", required=True, help="Exact `obs['cell_type']` value, e.g. 'naive B cell'")
     data_group.add_argument("--h5ad-path", required=True)
+    data_group.add_argument("--cell-type", required=True, help="Exact `obs['cell_type']` value, e.g. 'naive B cell'")
+    data_group.add_argument(
+        "--top-genes-csv",
+        required=True,
+        help="CSV with a 'gene_id' column (output of scripts/run_heritability_ranking.py's top_N_genes.csv)",
+    )
     data_group.add_argument("--min-cells-per-donor", type=int, default=5)
-    data_group.add_argument("--val-frac", type=float, default=0.15)
-    data_group.add_argument("--test-frac", type=float, default=0.15)
+    data_group.add_argument("--donor-val-frac", type=float, default=0.15)
+    data_group.add_argument("--donor-test-frac", type=float, default=0.15)
+    data_group.add_argument("--gene-val-frac", type=float, default=0.15)
+    data_group.add_argument("--gene-test-frac", type=float, default=0.15)
+    data_group.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Also used for train/eval shuffling; must match --seed used for scripts/run_heritability_ranking.py so donor splits agree",
+    )
 
     genome_group = parser.add_argument_group("genome")
-    genome_group.add_argument("--vcf-dir", required=True, help="Directory containing one VCF per chromosome")
+    genome_group.add_argument("--vcf-dir", required=True, help="Directory containing one (phased) VCF per chromosome")
     genome_group.add_argument("--vcf-filename-template", default="{chrom}.vcf.gz")
-    genome_group.add_argument(
-        "--vcf-chrom-style",
-        choices=["chr", "no_chr"],
-        default=None,
-        help="Normalize chromosome naming to VCF convention if it differs from the GTF's",
-    )
+    genome_group.add_argument("--vcf-chrom-style", choices=["chr", "no_chr"], default=None)
     genome_group.add_argument("--genome-fasta", required=True, help="Indexed reference genome FASTA (e.g. hg38)")
     genome_group.add_argument("--gtf", required=True, help="GTF/GFF gene annotation, used for TSS lookup")
-    genome_group.add_argument("--seq-len", type=int, default=49152)
+    genome_group.add_argument("--seq-len", type=int, default=40_000, help="TSS-centered window size (paper default: 40kb)")
+    genome_group.add_argument("--vcf-sample-id-scheme", choices=["onek1k", "identity"], default="onek1k")
+    genome_group.add_argument("--vcf-sample-id-prefix", default="OneK1K_")
+    genome_group.add_argument("--donor-id-map", default=None, help="Optional 2-col CSV (h5ad_donor_id,vcf_sample_id) override")
     genome_group.add_argument(
-        "--vcf-sample-id-scheme",
-        choices=["onek1k", "identity"],
-        default="onek1k",
-        help=(
-            "How to map h5ad donor_id -> genotype-file sample ID. 'onek1k' (default) "
-            "implements the confirmed OneK1K convention: donor_id '{X}_{Y}' -> sample "
-            "ID '{prefix}{Y}' (e.g. '10_10' -> 'OneK1K_10'). 'identity' assumes they "
-            "are the same string. Use --donor-id-map for exceptions to either."
-        ),
-    )
-    genome_group.add_argument(
-        "--vcf-sample-id-prefix",
-        default="OneK1K_",
-        help="Prefix used by --vcf-sample-id-scheme=onek1k (ignored otherwise)",
-    )
-    genome_group.add_argument(
-        "--donor-id-map",
-        default=None,
-        help=(
-            "Optional 2-column CSV (h5ad_donor_id,vcf_sample_id) for donors that don't "
-            "follow --vcf-sample-id-scheme; entries here always take precedence"
-        ),
+        "--strict-phasing",
+        action="store_true",
+        help="Raise instead of skipping heterozygous sites that aren't marked phased in the VCF",
     )
 
-    model_group = parser.add_argument_group("model")
-    model_group.add_argument("--random-weights", action="store_true", help="Smoke-test only: skip the pretrained Enformer download")
-    model_group.add_argument("--freeze-enformer", action="store_true", help="Only train the (mu, sigma) head")
-    model_group.add_argument("--finetune-last-n-layers", type=int, default=None)
+    model_group = parser.add_argument_group("model (defaults are the paper's bolded hyperparameters)")
+    model_group.add_argument("--first-layer-kernel-number", type=int, default=900)
+    model_group.add_argument("--first-layer-kernel-size", type=int, default=10)
+    model_group.add_argument("--int-layers-kernel-number", type=int, default=256)
+    model_group.add_argument("--int-layers-kernel-size", type=int, default=5)
+    model_group.add_argument("--hidden-size", type=int, default=256)
+    model_group.add_argument("--n-conv-blocks", type=int, default=5)
+    model_group.add_argument("--n-dilated-conv-blocks", type=int, default=0)
+    model_group.add_argument("--h-layers", type=int, default=1)
+    model_group.add_argument("--pooling-size", type=int, default=10)
+    model_group.add_argument("--pooling-type", choices=["avg", "max"], default="avg")
+    model_group.add_argument("--no-batch-norm", action="store_true")
+    model_group.add_argument("--dropout", type=float, default=0.0)
+    model_group.add_argument("--subtract-or-concat", choices=["subtract", "concat"], default="subtract")
 
     train_group = parser.add_argument_group("training")
-    train_group.add_argument("--batch-size", type=int, default=8, help="Donors per training step")
-    train_group.add_argument("--epochs", type=int, default=20)
-    train_group.add_argument("--lr", type=float, default=5e-6)
+    train_group.add_argument("--batch-size", type=int, default=32, help="(gene, donor) pairs per training step")
+    train_group.add_argument("--eval-batch-size", type=int, default=64)
+    train_group.add_argument("--epochs", type=int, default=50)
+    train_group.add_argument("--lr", type=float, default=1e-3)
     train_group.add_argument("--weight-decay", type=float, default=0.0)
-    train_group.add_argument("--grad-clip", type=float, default=0.05)
+    train_group.add_argument("--grad-clip", type=float, default=1.0)
     train_group.add_argument("--eval-every", type=int, default=1)
     train_group.add_argument("--patience", type=int, default=10)
-    train_group.add_argument("--seed", type=int, default=0)
+    train_group.add_argument("--lam-ref", type=float, default=1.0, help="Mean-head MSE loss weight (paper default: 1)")
+    train_group.add_argument("--lam-diff", type=float, default=10.0, help="Diff-head GNLL loss weight (paper default: 10)")
+    train_group.add_argument(
+        "--max-eval-pairs",
+        type=int,
+        default=5000,
+        help="Cap each eval-matrix cell's (gene, donor) pairs via random subsampling, for tractable per-epoch/final eval cost",
+    )
+    train_group.add_argument("--num-workers", type=int, default=0)
     train_group.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     train_group.add_argument("--out-dir", default=None)
     train_group.add_argument("--wandb", action="store_true")
-    train_group.add_argument(
-        "--no-save-checkpoint",
-        action="store_true",
-        help="Skip writing best_model.pt to --out-dir (prediction CSVs are still saved). Useful for quick/repeated runs where the checkpoint itself isn't needed.",
-    )
+    train_group.add_argument("--no-save-checkpoint", action="store_true")
 
     return parser.parse_args()
 
@@ -141,125 +151,189 @@ def load_donor_id_map(path: Optional[str]) -> Dict[str, str]:
     return dict(zip(df["h5ad_donor_id"].astype(str), df["vcf_sample_id"].astype(str)))
 
 
-def build_datasets(args: argparse.Namespace):
-    table, split = prepare_gene_celltype_data(
-        h5ad_path=args.h5ad_path,
-        gene=args.gene,
-        cell_type=args.cell_type,
-        min_cells_per_donor=args.min_cells_per_donor,
-        val_frac=args.val_frac,
-        test_frac=args.test_frac,
-        seed=args.seed,
-    )
+def load_top_genes(path: str) -> List[str]:
+    df = pd.read_csv(path)
+    if "gene_id" not in df.columns:
+        raise ValueError(f"{path} must have a 'gene_id' column (e.g. output of scripts/run_heritability_ranking.py)")
+    return df["gene_id"].astype(str).tolist()
+
+
+def build_pipeline(args: argparse.Namespace):
+    gene_ids = load_top_genes(args.top_genes_csv)
+    print(f"[genes] loaded {len(gene_ids)} candidate genes from {args.top_genes_csv}")
 
     annotation = GeneAnnotation(args.gtf)
-    gene_record = annotation.get(args.gene)
+    gene_records = {g: annotation.get(g) for g in gene_ids}
+
+    cell_data = load_celltype_multigene_cells(args.h5ad_path, args.cell_type, gene_ids)
+    table = build_multigene_donor_table(cell_data, min_cells_per_donor=args.min_cells_per_donor)
+    print(f"[data] {len(table.donor_ids)} donors have >= {args.min_cells_per_donor} cells for at least one gene")
+
+    donor_universe = get_celltype_donor_ids(args.h5ad_path, args.cell_type)
+    raw_donor_split = split_donors(donor_universe, val_frac=args.donor_val_frac, test_frac=args.donor_test_frac, seed=args.seed)
+    table_donor_set = set(table.donor_ids)
+    donor_split = DonorSplit(
+        train=[d for d in raw_donor_split.train if d in table_donor_set],
+        val=[d for d in raw_donor_split.val if d in table_donor_set],
+        test=[d for d in raw_donor_split.test if d in table_donor_set],
+    )
+    print(
+        f"[donors] train={len(donor_split.train)} val={len(donor_split.val)} test={len(donor_split.test)} "
+        f"(out of {len(donor_universe)} total for this cell type)"
+    )
+
+    gene_to_chrom = {g: gene_records[g].chrom for g in gene_ids}
+    gene_split = split_genes_by_chromosome(gene_to_chrom, val_frac=args.gene_val_frac, test_frac=args.gene_test_frac, seed=args.seed)
+    print(f"[genes] {gene_split.summary()}")
+
+    compute_population_means(table, donor_split.train)
+
     reference = ReferenceGenome(args.genome_fasta)
     vcf_reader = VCFGenotypeReader(args.vcf_dir, filename_template=args.vcf_filename_template)
     donor_id_map = load_donor_id_map(args.donor_id_map)
-
     if args.vcf_sample_id_scheme == "onek1k":
-        sample_id_fn = lambda donor_id: onek1k_sample_id_from_donor_id(donor_id, prefix=args.vcf_sample_id_prefix)
+        sample_id_fn = lambda d: onek1k_sample_id_from_donor_id(d, prefix=args.vcf_sample_id_prefix)  # noqa: E731
     else:
-        sample_id_fn = lambda donor_id: donor_id
+        sample_id_fn = lambda d: d  # noqa: E731
 
-    sequence_builder = DonorSequenceBuilder(
+    sequence_builder = PersonalGenomeSequenceBuilder(
         reference=reference,
         vcf_reader=vcf_reader,
-        gene=gene_record,
+        genes=gene_records,
         seq_len=args.seq_len,
         vcf_chrom_style=args.vcf_chrom_style,
         donor_id_to_sample_id=donor_id_map,
         sample_id_fn=sample_id_fn,
+        strict_phasing=args.strict_phasing,
     )
 
-    train_ds = SingleCellDonorDataset(split.train, table, sequence_builder)
-    val_ds = PseudobulkEvalDataset(split.val, table, sequence_builder)
-    test_ds = PseudobulkEvalDataset(split.test, table, sequence_builder)
+    train_ds = PersonalGenomeDatasetSC(gene_split.train, donor_split.train, table, sequence_builder)
+    print(f"[data] train pairs (train genes x train donors): {len(train_ds)}")
 
-    print(
-        f"[data] donors -> train={len(train_ds)} val={len(val_ds)} test={len(test_ds)} "
-        f"(min_cells_per_donor={args.min_cells_per_donor})"
-    )
-    return train_ds, val_ds, test_ds, gene_record
+    eval_gene_donor_lists = {
+        "seen_gene_seen_donor": (gene_split.train, donor_split.train),
+        "seen_gene_val_donor": (gene_split.train, donor_split.val),
+        "seen_gene_unseen_donor": (gene_split.train, donor_split.test),
+        "unseen_gene_seen_donor": (gene_split.test, donor_split.train),
+        "unseen_gene_unseen_donor": (gene_split.test, donor_split.test),
+    }
+    eval_datasets = {}
+    for name, (genes, donors) in eval_gene_donor_lists.items():
+        eval_datasets[name] = PersonalGenomeEvalDataset(
+            genes, donors, table, sequence_builder, max_pairs=args.max_eval_pairs, seed=args.seed
+        )
+        print(f"[data] eval set '{name}': {len(eval_datasets[name])} pairs")
+
+    return train_ds, eval_datasets, donor_split, gene_split
 
 
 @torch.no_grad()
-def run_pseudobulk_eval(model: VariformerGNLL, dataset: PseudobulkEvalDataset, device: str) -> pd.DataFrame:
+def run_eval(model: PSAGEnetSC, dataset: PersonalGenomeEvalDataset, device: str, batch_size: int) -> pd.DataFrame:
     model.eval()
-    loader = DataLoader(dataset, batch_size=max(1, len(dataset)), shuffle=False)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_eval_batch)
     rows: List[dict] = []
-    for seqs, pseudobulk_mean, empirical_std, n_cells, donor_ids in loader:
-        seqs = seqs.to(device)
-        mu, sigma = model(seqs)
-        mu = mu.cpu().numpy()
-        sigma = sigma.cpu().numpy()
-        pseudobulk_mean = pseudobulk_mean.numpy()
-        empirical_std = empirical_std.numpy()
-        n_cells = n_cells.numpy()
-        for i, donor_id in enumerate(donor_ids):
+    for ref, mat, pat, pseudobulk_mean, pseudobulk_std, population_mean, n_cells, gene_ids, donor_ids in loader:
+        ref, mat, pat = ref.to(device), mat.to(device), pat.to(device)
+        m_hat, d_hat, sigma_d_hat = model(ref, mat, pat)
+        mu_hat = (m_hat + d_hat).cpu().numpy()
+        m_hat_np = m_hat.cpu().numpy()
+        d_hat_np = d_hat.cpu().numpy()
+        sigma_np = sigma_d_hat.cpu().numpy()
+        pseudobulk_mean_np = pseudobulk_mean.numpy()
+        pseudobulk_std_np = pseudobulk_std.numpy()
+        population_mean_np = population_mean.numpy()
+        n_cells_np = n_cells.numpy()
+        for i in range(len(gene_ids)):
             rows.append(
                 {
-                    "donor_id": donor_id,
-                    "y_true_pseudobulk_mean": float(pseudobulk_mean[i]),
-                    "y_true_empirical_std": float(empirical_std[i]),
-                    "y_pred_mu": float(mu[i]),
-                    "y_pred_sigma": float(sigma[i]),
-                    "n_cells": int(n_cells[i]),
+                    "gene_id": gene_ids[i],
+                    "donor_id": donor_ids[i],
+                    "y_true_mean": float(pseudobulk_mean_np[i]),
+                    "y_true_std": float(pseudobulk_std_np[i]),
+                    "y_true_population_mean": float(population_mean_np[i]),
+                    "y_pred_mean": float(mu_hat[i]),
+                    "y_pred_m_hat": float(m_hat_np[i]),
+                    "y_pred_d_hat": float(d_hat_np[i]),
+                    "y_pred_sigma": float(sigma_np[i]),
+                    "n_cells": int(n_cells_np[i]),
                 }
             )
     return pd.DataFrame(rows)
 
 
 def summarize_eval(df: pd.DataFrame, prefix: str) -> Dict[str, float]:
-    true_mean = df["y_true_pseudobulk_mean"].to_numpy()
-    true_std = df["y_true_empirical_std"].to_numpy()
-    if np.std(true_mean) == 0:
-        print(f"[{prefix}] note: pseudobulk targets are constant across donors -- pseudobulk correlation is undefined, skipping (nan)")
-    if np.std(true_std) == 0:
-        print(
-            f"[{prefix}] note: empirical-std targets are constant across donors (e.g. every donor has ~1 cell) "
-            "-- sigma-calibration correlation is undefined, skipping (nan)"
-        )
-
-    mean_corr = pseudobulk_correlation(df["y_pred_mu"].to_numpy(), true_mean)
-    sigma_corr = sigma_calibration_correlation(df["y_pred_sigma"].to_numpy(), true_std)
+    mean_grouped = grouped_correlation(df, true_col="y_true_mean", pred_col="y_pred_mean")
+    sigma_grouped = grouped_correlation(df, true_col="y_true_std", pred_col="y_pred_sigma")
     return {
-        f"{prefix}/pseudobulk_pearson_r": mean_corr.pearson_r,
-        # Parametric p-value (assumes bivariate normality) for the pseudobulk
-        # correlation given only `n_donors` samples -- a quick, free sanity
-        # check on how surprising the reported correlation really is. See
-        # `src/diagnose.py` for a more robust, assumption-free permutation
-        # version of this same question, plus other "is this too easy?" checks.
-        f"{prefix}/pseudobulk_pearson_p": mean_corr.pearson_p,
-        f"{prefix}/pseudobulk_r2": mean_corr.r2,
-        f"{prefix}/sigma_calibration_pearson_r": sigma_corr.pearson_r,
-        f"{prefix}/sigma_calibration_pearson_p": sigma_corr.pearson_p,
-        f"{prefix}/sigma_calibration_r2": sigma_corr.r2,
-        f"{prefix}/n_donors": mean_corr.n,
+        f"{prefix}/mean_median_per_gene_pearson_r": mean_grouped.median_per_gene_r,
+        f"{prefix}/mean_median_per_donor_pearson_r": mean_grouped.median_per_donor_r,
+        f"{prefix}/sigma_median_per_gene_pearson_r": sigma_grouped.median_per_gene_r,
+        f"{prefix}/sigma_median_per_donor_pearson_r": sigma_grouped.median_per_donor_r,
+        f"{prefix}/n_genes": mean_grouped.n_genes,
+        f"{prefix}/n_donors": mean_grouped.n_donors,
+        f"{prefix}/n_pairs": len(df),
     }
+
+
+def save_splits(out_dir: str, donor_split: DonorSplit, gene_split: GeneSplit) -> None:
+    donor_rows = (
+        [{"donor_id": d, "split": "train"} for d in donor_split.train]
+        + [{"donor_id": d, "split": "val"} for d in donor_split.val]
+        + [{"donor_id": d, "split": "test"} for d in donor_split.test]
+    )
+    pd.DataFrame(donor_rows).to_csv(os.path.join(out_dir, "donor_split.csv"), index=False)
+
+    gene_rows = (
+        [{"gene_id": g, "split": "train"} for g in gene_split.train]
+        + [{"gene_id": g, "split": "val"} for g in gene_split.val]
+        + [{"gene_id": g, "split": "test"} for g in gene_split.test]
+    )
+    pd.DataFrame(gene_rows).to_csv(os.path.join(out_dir, "gene_split.csv"), index=False)
 
 
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    out_dir = args.out_dir or os.path.join("results", f"{args.gene}_{args.cell_type}".replace(" ", "_"))
+    out_dir = args.out_dir or os.path.join("results", args.cell_type.replace(" ", "_"))
     os.makedirs(out_dir, exist_ok=True)
 
-    train_ds, val_ds, test_ds, gene_record = build_datasets(args)
+    train_ds, eval_datasets, donor_split, gene_split = build_pipeline(args)
+    save_splits(out_dir, donor_split, gene_split)
+
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_donor_batch
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_personal_genome_batch,
+        num_workers=args.num_workers,
     )
 
-    model = VariformerGNLL(
-        random_weights=args.random_weights,
-        freeze_enformer=args.freeze_enformer,
-        finetune_last_n_layers_only=args.finetune_last_n_layers,
-    ).to(args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    model_config = {
+        "input_length": args.seq_len,
+        "first_layer_kernel_number": args.first_layer_kernel_number,
+        "int_layers_kernel_number": args.int_layers_kernel_number,
+        "first_layer_kernel_size": args.first_layer_kernel_size,
+        "int_layers_kernel_size": args.int_layers_kernel_size,
+        "hidden_size": args.hidden_size,
+        "n_conv_blocks": args.n_conv_blocks,
+        "n_dilated_conv_blocks": args.n_dilated_conv_blocks,
+        "h_layers": args.h_layers,
+        "pooling_size": args.pooling_size,
+        "pooling_type": args.pooling_type,
+        "batch_norm": not args.no_batch_norm,
+        "dropout": args.dropout,
+        "subtract_or_concat": args.subtract_or_concat,
+    }
+    with open(os.path.join(out_dir, "model_config.json"), "w") as fh:
+        json.dump(model_config, fh, indent=2)
 
-    logger = get_logger(args.wandb, config=vars(args))
+    model = PSAGEnetSC(**model_config).to(args.device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[model] PSAGEnetSC with {n_params:,} parameters, trunk output dim={model.trunk.output_dim}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    logger = get_logger(args.wandb, project="sc-genex-psagenet-sc", config=vars(args))
 
     best_metric = -float("inf")
     best_state: Optional[dict] = None
@@ -267,34 +341,45 @@ def main() -> None:
 
     for epoch in range(args.epochs):
         model.train()
-        epoch_losses = []
-        for seqs, cell_targets, donor_ids in train_loader:
-            seqs = seqs.to(args.device)
-            cell_targets = [t.to(args.device) for t in cell_targets]
+        losses, mean_losses, diff_losses = [], [], []
+        for ref, mat, pat, population_mean, cell_diff, gene_ids, donor_ids in train_loader:
+            ref, mat, pat = ref.to(args.device), mat.to(args.device), pat.to(args.device)
+            population_mean = population_mean.to(args.device)
+            cell_diff = [t.to(args.device) for t in cell_diff]
 
-            mu, sigma = model(seqs)
-            loss = per_cell_gaussian_nll(mu, sigma, cell_targets)
+            m_hat, d_hat, sigma_d_hat = model(ref, mat, pat)
+            loss_components = psagenet_sc_loss(
+                m_hat, d_hat, sigma_d_hat, population_mean, cell_diff, lam_ref=args.lam_ref, lam_diff=args.lam_diff
+            )
 
             optimizer.zero_grad()
-            loss.backward()
+            loss_components.total.backward()
             if args.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
-            epoch_losses.append(loss.item())
+            losses.append(loss_components.total.item())
+            mean_losses.append(loss_components.mean_loss.item())
+            diff_losses.append(loss_components.diff_loss.item())
 
-        train_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
-        log_payload = {"train/loss": train_loss, "epoch": epoch}
-        print(f"[epoch {epoch}] train_loss={train_loss:.4f}")
+        log_payload = {
+            "train/loss": float(np.mean(losses)) if losses else float("nan"),
+            "train/mean_loss": float(np.mean(mean_losses)) if mean_losses else float("nan"),
+            "train/diff_loss": float(np.mean(diff_losses)) if diff_losses else float("nan"),
+            "epoch": epoch,
+        }
+        print(f"[epoch {epoch}] train_loss={log_payload['train/loss']:.4f}")
 
         if epoch % args.eval_every == 0:
-            val_df = run_pseudobulk_eval(model, val_ds, args.device)
-            val_metrics = summarize_eval(val_df, "val")
-            log_payload.update(val_metrics)
-            val_df.to_csv(os.path.join(out_dir, f"predictions_val_epoch{epoch}.csv"), index=False)
-            print(f"[epoch {epoch}] " + " ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in val_metrics.items()))
+            monitor_df = run_eval(model, eval_datasets["seen_gene_val_donor"], args.device, args.eval_batch_size)
+            monitor_metrics = summarize_eval(monitor_df, "val")
+            log_payload.update(monitor_metrics)
+            monitor = monitor_metrics["val/mean_median_per_gene_pearson_r"]
+            print(
+                f"[epoch {epoch}] val/mean_median_per_gene_pearson_r="
+                f"{monitor:.4f}" if not np.isnan(monitor) else f"[epoch {epoch}] val metric undefined (nan)"
+            )
 
-            monitor = val_metrics["val/pseudobulk_pearson_r"]
             if not np.isnan(monitor) and monitor > best_metric:
                 best_metric = monitor
                 best_state = copy.deepcopy(model.state_dict())
@@ -305,17 +390,27 @@ def main() -> None:
         logger.log(log_payload, step=epoch)
 
         if epochs_without_improvement >= args.patience:
-            print(f"[early stop] no val/pseudobulk_pearson_r improvement for {args.patience} evals")
+            print(f"[early stop] no val/mean_median_per_gene_pearson_r improvement for {args.patience} evals")
             break
 
     if best_state is not None:
         model.load_state_dict(best_state)
+    else:
+        print("[warning] validation metric was always nan -- reporting final-epoch weights instead of a 'best' checkpoint")
 
-    test_df = run_pseudobulk_eval(model, test_ds, args.device)
-    test_metrics = summarize_eval(test_df, "test")
-    test_df.to_csv(os.path.join(out_dir, "predictions_test_final.csv"), index=False)
-    logger.log(test_metrics)
-    print("[test] " + " ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in test_metrics.items()))
+    print("[final] evaluating full 4-way seen/unseen-gene x seen/unseen-individual matrix")
+    final_summary: Dict[str, float] = {}
+    for name in EVAL_MATRIX_CELLS:
+        df = run_eval(model, eval_datasets[name], args.device, args.eval_batch_size)
+        df.to_csv(os.path.join(out_dir, f"predictions_{name}.csv"), index=False)
+        metrics = summarize_eval(df, name)
+        final_summary.update(metrics)
+        mean_r = metrics[f"{name}/mean_median_per_gene_pearson_r"]
+        sigma_r = metrics[f"{name}/sigma_median_per_gene_pearson_r"]
+        print(f"[final:{name}] median per-gene Pearson r: mean={mean_r:.4f} sigma={sigma_r:.4f} (n_pairs={metrics[f'{name}/n_pairs']})")
+
+    logger.log(final_summary)
+    pd.DataFrame([final_summary]).to_csv(os.path.join(out_dir, "final_eval_matrix_summary.csv"), index=False)
 
     if args.no_save_checkpoint:
         print("[checkpoint] --no-save-checkpoint set, skipping best_model.pt")

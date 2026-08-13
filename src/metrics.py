@@ -1,21 +1,26 @@
 """Evaluation metrics computed at the donor (pseudobulk) level.
 
-Two things are checked, mirroring Variformer's cross-individual R2/Pearson
-evaluation but extended with the uncertainty-quality check that is the whole
-point of this POC:
+Two kinds of checks live here:
 
-1. `pseudobulk_correlation`: does predicted `mu` (from an unseen donor's
-   personalized sequence) track that donor's true pseudobulk mean expression?
-2. `sigma_calibration_correlation`: does predicted `sigma` track that donor's
-   true empirical cell-cell std? If it does, the model has learned something
-   about expression *specificity/variability* from genotype alone, which is
-   the hypothesis this POC is meant to test.
+1. `pseudobulk_correlation`/`sigma_calibration_correlation`: single-group
+   Pearson r/R2 (does predicted `mu` track true pseudobulk mean expression,
+   across whatever set of donors is passed in? does predicted `sigma` track
+   true empirical cell-cell std?).
+2. `grouped_correlation`: pSAGE-net's actual model-selection/reporting
+   metric -- **per-gene** Pearson r (correlating predictions to truth across
+   *donors*, separately for each gene) and **per-donor** Pearson r
+   (correlating across *genes*, separately for each donor), each summarized
+   by their median across genes/donors. This is what `src/train.py` computes
+   for every cell of the 4-way seen/unseen-gene x seen/unseen-individual
+   evaluation matrix, and what `src/evaluate.py` uses for the final
+   model-vs-PrediXcan comparison.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 from scipy.stats import pearsonr
 
 
@@ -63,3 +68,66 @@ def pseudobulk_correlation(pred_mu: np.ndarray, true_pseudobulk_mean: np.ndarray
 def sigma_calibration_correlation(pred_sigma: np.ndarray, empirical_std: np.ndarray) -> CorrelationResult:
     """Pearson r / R2 between predicted sigma and true empirical cell-cell std, across donors."""
     return _correlation(np.asarray(empirical_std, dtype=np.float64), np.asarray(pred_sigma, dtype=np.float64))
+
+
+def _grouped_correlation_table(df: pd.DataFrame, group_col: str, true_col: str, pred_col: str) -> pd.DataFrame:
+    """One `_correlation` per distinct value of `group_col` (e.g. one Pearson r per gene, across donors)."""
+    rows = []
+    for group_value, group_df in df.groupby(group_col):
+        result = _correlation(group_df[true_col].to_numpy(dtype=np.float64), group_df[pred_col].to_numpy(dtype=np.float64))
+        rows.append(
+            {
+                group_col: group_value,
+                "pearson_r": result.pearson_r,
+                "pearson_p": result.pearson_p,
+                "r2": result.r2,
+                "n": result.n,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+@dataclass
+class GroupedCorrelationResult:
+    """Per-gene and per-donor Pearson r tables, plus their medians -- pSAGE-net's
+    primary reporting metric (Fig 1c/1d: distribution of per-gene Pearson r across
+    a set of held-out individuals).
+    """
+
+    per_gene: pd.DataFrame  # columns: gene_id, pearson_r, pearson_p, r2, n
+    per_donor: pd.DataFrame  # columns: donor_id, pearson_r, pearson_p, r2, n
+    median_per_gene_r: float
+    median_per_donor_r: float
+    n_genes: int
+    n_donors: int
+
+
+def grouped_correlation(
+    df: pd.DataFrame,
+    gene_col: str = "gene_id",
+    donor_col: str = "donor_id",
+    true_col: str = "y_true",
+    pred_col: str = "y_pred",
+) -> GroupedCorrelationResult:
+    """Computes per-gene (across donors) and per-donor (across genes) Pearson r.
+
+    `df` must have one row per `(gene, donor)` example with `true_col`/
+    `pred_col` columns. Used for every cell of the 4-way seen/unseen-gene x
+    seen/unseen-individual evaluation matrix in `src/train.py`: e.g. for the
+    "unseen gene / unseen individual" cell, `per_gene` answers "for this
+    never-trained-on gene, how well does the model rank never-seen
+    individuals by predicted expression?", matching the paper's headline
+    evaluation.
+    """
+    per_gene = _grouped_correlation_table(df, gene_col, true_col, pred_col)
+    per_donor = _grouped_correlation_table(df, donor_col, true_col, pred_col)
+    median_gene_r = float(np.nanmedian(per_gene["pearson_r"])) if len(per_gene) else float("nan")
+    median_donor_r = float(np.nanmedian(per_donor["pearson_r"])) if len(per_donor) else float("nan")
+    return GroupedCorrelationResult(
+        per_gene=per_gene,
+        per_donor=per_donor,
+        median_per_gene_r=median_gene_r,
+        median_per_donor_r=median_donor_r,
+        n_genes=len(per_gene),
+        n_donors=len(per_donor),
+    )

@@ -1,25 +1,60 @@
-"""Extracts per-cell expression for one (gene, cell_type) pair from the OneK1K
-h5ad, normalizes it, groups it by donor, and produces donor train/val/test
-splits.
+"""Multi-gene, single-cell-type extraction from the OneK1K h5ad.
 
-Kept deliberately simple ("low-level POC"): uses AnnData's backed mode so the
-~4GB h5ad is never fully loaded into RAM -- only the rows matching the
-requested cell type and the single requested gene column are ever materialized.
+Two loaders exist, at different granularities, both built on a single backed
+h5ad read (never materializing the full `[cells x genes]` matrix -- only the
+requested cell type's rows and requested genes' columns are ever read):
+
+1. `load_celltype_pseudobulk_matrix`: collapses straight to a `[donors x
+   genes]` pseudobulk-mean matrix via sparse donor-indicator multiplication,
+   so it stays cheap even across the full protein-coding-autosomal candidate
+   gene universe (tens of thousands of genes) used by the heritability
+   ranking in `src/heritability.py`.
+2. `load_celltype_multigene_cells` + `build_multigene_donor_table`: keeps
+   every individual cell's normalized expression value, for the (much
+   smaller, ~1000-gene) final training gene set -- these per-cell values are
+   the model's actual training targets (see `src/dataset.py`, `src/loss.py`).
+
+Both use the same `log1p(CP-median)` per-cell normalization as the original
+single-gene POC.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List
+from dataclasses import dataclass, field
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 
 try:
     import anndata as ad
 except ImportError:  # pragma: no cover - optional at import time for tooling
     ad = None
 
-DEFAULT_SEED = 0
+# Re-exported for backwards compatibility with code that imported these from
+# `data.preprocess` before donor/gene splitting moved to `src/splits.py`.
+from src.splits import DEFAULT_SEED, DonorSplit, split_donors  # noqa: F401
+
+
+def get_celltype_donor_ids(
+    h5ad_path: str, cell_type: str, donor_col: str = "donor_id", cell_type_col: str = "cell_type"
+) -> List[str]:
+    """All distinct donors with at least one cell of `cell_type` (gene-independent).
+
+    Used to compute a single canonical donor split (see `src/splits.py`) that
+    is reused for heritability ranking, model training, and final evaluation
+    -- so "unseen individual" means the same set of individuals everywhere in
+    the pipeline, and heritability ranking never trains/ranks on donors held
+    out as the final test set.
+    """
+    if ad is None:
+        raise ImportError("anndata is required to read the OneK1K h5ad file")
+    adata = ad.read_h5ad(h5ad_path, backed="r")
+    cell_mask = (adata.obs[cell_type_col] == cell_type).to_numpy()
+    if cell_mask.sum() == 0:
+        raise ValueError(f"No cells found for cell_type='{cell_type}'")
+    donors = adata.obs.loc[cell_mask, donor_col].astype(str).unique().tolist()
+    return sorted(donors)
 
 
 def _resolve_gene_index(var: "pd.DataFrame", gene: str) -> int:
@@ -33,37 +68,31 @@ def _resolve_gene_index(var: "pd.DataFrame", gene: str) -> int:
     raise KeyError(f"Gene '{gene}' not found by Ensembl ID or feature_name in var")
 
 
-@dataclass
-class CellLevelData:
-    gene: str
-    cell_type: str
-    donor_id: np.ndarray  # [n_cells] str
-    raw_count: np.ndarray  # [n_cells] float32
-    total_count: np.ndarray  # [n_cells] float32, library size (e.g. nCount_RNA)
-    normalized_expr: np.ndarray  # [n_cells] float32, log1p(CP-median)
+def _normalize_sparse_rows(X: "sp.spmatrix", total_count: np.ndarray) -> "sp.csr_matrix":
+    """CP-median + log1p per-cell (row) normalization, preserving sparsity.
 
-
-def normalize_library_size(raw_count: np.ndarray, total_count: np.ndarray) -> np.ndarray:
-    """CP-median + log1p normalization (standard scanpy-style per-cell normalization).
-
-    This removes technical (sequencing-depth) variation between cells so that
-    the remaining cell-cell spread reflects biological variability, which is
-    exactly what the sigma head is meant to capture.
+    `log1p(0) == 0`, so scaling each row by a positive per-cell factor and
+    then applying `log1p` to only the stored (nonzero) entries is exact --
+    there's no need to ever densify the matrix.
     """
+    X = X.tocsr()
     median_total = float(np.median(total_count))
-    cp_median = raw_count / np.clip(total_count, 1.0, None) * median_total
-    return np.log1p(cp_median).astype(np.float32)
+    scaling = (median_total / np.clip(total_count, 1.0, None)).astype(np.float32)
+    norm = sp.diags(scaling) @ X
+    norm = norm.tocsr()
+    norm.data = np.log1p(norm.data).astype(np.float32)
+    return norm
 
 
-def load_gene_celltype_cells(
+def _read_celltype_gene_submatrix(
     h5ad_path: str,
-    gene: str,
     cell_type: str,
-    donor_col: str = "donor_id",
-    cell_type_col: str = "cell_type",
-    library_size_col: str = "nCount_RNA",
-) -> CellLevelData:
-    """Extracts per-cell raw + normalized expression for one gene x cell-type."""
+    gene_ids: Sequence[str],
+    donor_col: str,
+    cell_type_col: str,
+    library_size_col: str,
+):
+    """Shared backed-mode h5ad read: cell-type-filtered rows, requested gene columns."""
     if ad is None:
         raise ImportError("anndata is required to read the OneK1K h5ad file")
 
@@ -72,94 +101,166 @@ def load_gene_celltype_cells(
     if cell_mask.sum() == 0:
         raise ValueError(f"No cells found for cell_type='{cell_type}'")
 
-    gene_idx = _resolve_gene_index(adata.var, gene)
-
-    sub = adata[cell_mask, [gene_idx]].to_memory()
-    x = sub.X
-    raw_count = np.asarray(x.todense() if hasattr(x, "todense") else x).reshape(-1).astype(np.float32)
-
-    donor_id = sub.obs[donor_col].astype(str).to_numpy()
+    gene_positions = [_resolve_gene_index(adata.var, g) for g in gene_ids]
+    sub = adata[cell_mask, gene_positions].to_memory()
+    X = sub.X
+    if not sp.issparse(X):
+        X = sp.csr_matrix(np.asarray(X))
     total_count = sub.obs[library_size_col].to_numpy().astype(np.float32)
-    normalized_expr = normalize_library_size(raw_count, total_count)
-
-    return CellLevelData(
-        gene=gene,
-        cell_type=cell_type,
-        donor_id=donor_id,
-        raw_count=raw_count,
-        total_count=total_count,
-        normalized_expr=normalized_expr,
-    )
+    donor_id = sub.obs[donor_col].astype(str).to_numpy()
+    return X, donor_id, total_count
 
 
 @dataclass
-class DonorSplit:
-    train: List[str]
-    val: List[str]
-    test: List[str]
-
-
-def split_donors(
-    donor_ids: List[str],
-    val_frac: float = 0.15,
-    test_frac: float = 0.15,
-    seed: int = DEFAULT_SEED,
-) -> DonorSplit:
-    """Seeded, non-overlapping donor split (mirrors Variformer's donor-level splits)."""
-    rng = np.random.RandomState(seed)
-    donors = sorted(set(donor_ids))
-    rng.shuffle(donors)
-    n = len(donors)
-    n_val = int(round(n * val_frac))
-    n_test = int(round(n * test_frac))
-    val = donors[:n_val]
-    test = donors[n_val : n_val + n_test]
-    train = donors[n_val + n_test :]
-    assert not (set(train) & set(val))
-    assert not (set(train) & set(test))
-    assert not (set(val) & set(test))
-    return DonorSplit(train=train, val=val, test=test)
-
-
-@dataclass
-class DonorTable:
-    """Per-donor grouping of cell-level targets, plus pseudobulk summary stats."""
+class PseudobulkMatrix:
+    """Per-donor mean `log1p(CP-median)` expression for many genes at once."""
 
     donor_ids: List[str]
-    cell_targets: Dict[str, np.ndarray]  # donor_id -> [n_cells_i] normalized expr
-    pseudobulk_mean: Dict[str, float]
-    pseudobulk_std: Dict[str, float]
+    gene_ids: List[str]
+    mean: "pd.DataFrame"  # [donors x genes]
     n_cells: Dict[str, int]
 
 
-def build_donor_table(data: CellLevelData, min_cells_per_donor: int = 5) -> DonorTable:
-    """Groups per-cell targets by donor and computes pseudobulk mean/std.
+def load_celltype_pseudobulk_matrix(
+    h5ad_path: str,
+    cell_type: str,
+    gene_ids: Sequence[str],
+    min_cells_per_donor: int = 1,
+    donor_col: str = "donor_id",
+    cell_type_col: str = "cell_type",
+    library_size_col: str = "nCount_RNA",
+) -> PseudobulkMatrix:
+    """One backed read for arbitrarily many genes -> `[donors x genes]` pseudobulk means.
 
-    Donors with fewer than `min_cells_per_donor` cells of this type are
-    dropped: with too few cells, both the pseudobulk mean and (especially)
-    the empirical cell-cell std are too noisy to be a meaningful training
-    or evaluation target.
+    Never densifies the full `[cells x genes]` matrix: normalization is done
+    on the sparse matrix's nonzero entries directly (see
+    `_normalize_sparse_rows`), and the donor-level mean is computed via a
+    single sparse `[n_donors, n_cells] @ [n_cells, n_genes]` multiplication
+    (a sparse "indicator/averaging" matrix), so memory stays bounded by
+    `n_donors x n_genes` regardless of how many candidate genes are passed in
+    -- this is what makes it cheap enough to run over the full
+    protein-coding-autosomal gene universe for heritability ranking.
     """
-    df = pd.DataFrame({"donor_id": data.donor_id, "normalized_expr": data.normalized_expr})
-    grouped = df.groupby("donor_id")["normalized_expr"]
+    X, donor_id, total_count = _read_celltype_gene_submatrix(
+        h5ad_path, cell_type, gene_ids, donor_col, cell_type_col, library_size_col
+    )
+    norm = _normalize_sparse_rows(X, total_count)
 
-    cell_targets: Dict[str, np.ndarray] = {}
-    pseudobulk_mean: Dict[str, float] = {}
-    pseudobulk_std: Dict[str, float] = {}
-    n_cells: Dict[str, int] = {}
+    donors_all = sorted(set(donor_id))
+    donor_to_idx = {d: i for i, d in enumerate(donors_all)}
+    row_idx = np.array([donor_to_idx[d] for d in donor_id])
+    n_cells_arr = np.bincount(row_idx, minlength=len(donors_all))
 
-    for donor_id, values in grouped:
-        values = values.to_numpy(dtype=np.float32, copy=True)
-        if len(values) < min_cells_per_donor:
+    indicator = sp.csr_matrix(
+        (1.0 / n_cells_arr[row_idx], (row_idx, np.arange(len(donor_id)))),
+        shape=(len(donors_all), len(donor_id)),
+    )
+    pseudobulk = indicator @ norm  # [n_donors, n_genes]
+    pseudobulk = np.asarray(pseudobulk.todense()) if sp.issparse(pseudobulk) else np.asarray(pseudobulk)
+
+    keep_mask = n_cells_arr >= min_cells_per_donor
+    donors_kept = [d for d, keep in zip(donors_all, keep_mask) if keep]
+    pseudobulk_kept = pseudobulk[keep_mask]
+
+    mean_df = pd.DataFrame(pseudobulk_kept, index=donors_kept, columns=list(gene_ids))
+    n_cells = {d: int(n_cells_arr[donor_to_idx[d]]) for d in donors_kept}
+    return PseudobulkMatrix(donor_ids=donors_kept, gene_ids=list(gene_ids), mean=mean_df, n_cells=n_cells)
+
+
+@dataclass
+class MultiGeneCellData:
+    """Per-cell normalized expression for a (typically small, ~1000-gene) gene set."""
+
+    donor_id: np.ndarray  # [n_cells] str
+    gene_ids: List[str]
+    normalized_expr: np.ndarray  # [n_cells, n_genes] float32, log1p(CP-median)
+
+
+def load_celltype_multigene_cells(
+    h5ad_path: str,
+    cell_type: str,
+    gene_ids: Sequence[str],
+    donor_col: str = "donor_id",
+    cell_type_col: str = "cell_type",
+    library_size_col: str = "nCount_RNA",
+) -> MultiGeneCellData:
+    """Per-cell (not pseudobulked) normalized expression for `gene_ids`.
+
+    Unlike `load_celltype_pseudobulk_matrix`, this densifies the normalized
+    matrix (`[n_cells, n_genes]`) since per-cell values -- not just donor
+    means -- are the actual model training targets. Only intended for the
+    final, much smaller (~1000-gene) training gene set, not the full
+    candidate universe.
+    """
+    X, donor_id, total_count = _read_celltype_gene_submatrix(
+        h5ad_path, cell_type, gene_ids, donor_col, cell_type_col, library_size_col
+    )
+    norm = _normalize_sparse_rows(X, total_count)
+    normalized_expr = np.asarray(norm.todense(), dtype=np.float32)
+    return MultiGeneCellData(donor_id=donor_id, gene_ids=list(gene_ids), normalized_expr=normalized_expr)
+
+
+@dataclass
+class MultiGeneDonorTable:
+    """Per-(gene, donor) cell-level targets + pseudobulk stats, for many genes at once.
+
+    `population_mean` (per gene, over TRAIN donors only) is filled in
+    separately by `compute_population_means` once the donor split is known --
+    it is the model's "mean expression" target (pSAGE-net's `m_g`, predicted
+    from reference sequence alone) and must never be computed using val/test
+    donors to avoid leaking their expression values into a target that val/
+    test examples are also scored against.
+    """
+
+    gene_ids: List[str]
+    donor_ids: List[str]
+    cell_targets: Dict[Tuple[str, str], np.ndarray]  # (gene_id, donor_id) -> [n_cells_i]
+    pseudobulk_mean: Dict[Tuple[str, str], float]
+    pseudobulk_std: Dict[Tuple[str, str], float]
+    n_cells: Dict[Tuple[str, str], int]
+    population_mean: Dict[str, float] = field(default_factory=dict)
+
+    def has(self, gene_id: str, donor_id: str) -> bool:
+        return (gene_id, donor_id) in self.cell_targets
+
+
+def build_multigene_donor_table(data: MultiGeneCellData, min_cells_per_donor: int = 5) -> MultiGeneDonorTable:
+    """Groups per-cell values by (gene, donor), dropping (gene, donor) pairs below the min-cells filter.
+
+    Vectorized over genes: cells are sorted by donor once, then each donor's
+    contiguous block of rows is reduced (mean/std) across all gene columns in
+    a single operation, rather than looping `groupby` per gene.
+    """
+    donor_id = data.donor_id
+    order = np.argsort(donor_id, kind="stable")
+    sorted_donors = donor_id[order]
+    sorted_expr = data.normalized_expr[order]  # [n_cells, n_genes]
+
+    unique_donors, start_idx, counts = np.unique(sorted_donors, return_index=True, return_counts=True)
+
+    cell_targets: Dict[Tuple[str, str], np.ndarray] = {}
+    pseudobulk_mean: Dict[Tuple[str, str], float] = {}
+    pseudobulk_std: Dict[Tuple[str, str], float] = {}
+    n_cells: Dict[Tuple[str, str], int] = {}
+    donor_ids_kept: List[str] = []
+
+    for donor, start, count in zip(unique_donors, start_idx, counts):
+        if count < min_cells_per_donor:
             continue
-        cell_targets[donor_id] = values
-        pseudobulk_mean[donor_id] = float(values.mean())
-        pseudobulk_std[donor_id] = float(values.std(ddof=0))
-        n_cells[donor_id] = len(values)
+        block = sorted_expr[start : start + count]  # [count, n_genes]
+        means = block.mean(axis=0)
+        stds = block.std(axis=0, ddof=0)
+        donor_ids_kept.append(str(donor))
+        for gi, gene in enumerate(data.gene_ids):
+            key = (gene, str(donor))
+            cell_targets[key] = block[:, gi].copy()
+            pseudobulk_mean[key] = float(means[gi])
+            pseudobulk_std[key] = float(stds[gi])
+            n_cells[key] = int(count)
 
-    donor_ids = sorted(cell_targets.keys())
-    return DonorTable(
-        donor_ids=donor_ids,
+    return MultiGeneDonorTable(
+        gene_ids=list(data.gene_ids),
+        donor_ids=sorted(donor_ids_kept),
         cell_targets=cell_targets,
         pseudobulk_mean=pseudobulk_mean,
         pseudobulk_std=pseudobulk_std,
@@ -167,38 +268,52 @@ def build_donor_table(data: CellLevelData, min_cells_per_donor: int = 5) -> Dono
     )
 
 
-def prepare_gene_celltype_data(
+def compute_population_means(table: MultiGeneDonorTable, train_donor_ids: Sequence[str]) -> Dict[str, float]:
+    """Per-gene population mean = mean of TRAIN donors' pseudobulk means (pSAGE-net's `m_g`).
+
+    Mutates and returns `table.population_mean`. Must be called with the
+    training donor split *before* building any dataset, since this value is
+    a fixed regression target shared by every (gene, donor) example
+    regardless of split.
+    """
+    train_set = set(train_donor_ids)
+    population_mean: Dict[str, float] = {}
+    for gene in table.gene_ids:
+        values = [table.pseudobulk_mean[(gene, d)] for d in table.donor_ids if d in train_set and table.has(gene, d)]
+        population_mean[gene] = float(np.mean(values)) if values else float("nan")
+    table.population_mean = population_mean
+    return population_mean
+
+
+def prepare_multigene_celltype_data(
     h5ad_path: str,
-    gene: str,
     cell_type: str,
+    gene_ids: Sequence[str],
     min_cells_per_donor: int = 5,
     val_frac: float = 0.15,
     test_frac: float = 0.15,
     seed: int = DEFAULT_SEED,
-) -> tuple[DonorTable, DonorSplit]:
-    """End-to-end: load, normalize, group by donor, and split donors."""
-    cell_data = load_gene_celltype_cells(h5ad_path, gene, cell_type)
-    table = build_donor_table(cell_data, min_cells_per_donor=min_cells_per_donor)
-    split = split_donors(table.donor_ids, val_frac=val_frac, test_frac=test_frac, seed=seed)
-    return table, split
+) -> Tuple[MultiGeneDonorTable, DonorSplit]:
+    """End-to-end: load per-cell values for `gene_ids`, group by donor, split donors, fill population means."""
+    cell_data = load_celltype_multigene_cells(h5ad_path, cell_type, gene_ids)
+    table = build_multigene_donor_table(cell_data, min_cells_per_donor=min_cells_per_donor)
+    donor_split = split_donors(table.donor_ids, val_frac=val_frac, test_frac=test_frac, seed=seed)
+    compute_population_means(table, donor_split.train)
+    return table, donor_split
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Preview per-cell/pseudobulk stats for a gene x cell-type")
+    parser = argparse.ArgumentParser(description="Preview per-cell/pseudobulk stats for a gene set x cell-type")
     parser.add_argument("--h5ad-path", required=True)
-    parser.add_argument("--gene", required=True)
+    parser.add_argument("--genes", nargs="+", required=True, help="One or more Ensembl gene IDs")
     parser.add_argument("--cell-type", required=True)
     parser.add_argument("--min-cells-per-donor", type=int, default=5)
     args = parser.parse_args()
 
-    cell_data = load_gene_celltype_cells(args.h5ad_path, args.gene, args.cell_type)
-    table = build_donor_table(cell_data, min_cells_per_donor=args.min_cells_per_donor)
-    print(f"Total cells: {len(cell_data.donor_id)}")
-    print(f"Donors passing min-cells filter: {len(table.donor_ids)}")
-    means = np.array(list(table.pseudobulk_mean.values()))
-    stds = np.array(list(table.pseudobulk_std.values()))
-    if len(means) > 0:
-        print(f"Pseudobulk mean expr across donors: mean={means.mean():.3f} std={means.std():.3f}")
-        print(f"Within-donor cell-cell std: mean={stds.mean():.3f} std={stds.std():.3f}")
+    table, split = prepare_multigene_celltype_data(args.h5ad_path, args.cell_type, args.genes, args.min_cells_per_donor)
+    print(f"Donors passing min-cells filter (any gene): {len(table.donor_ids)}")
+    print(f"train={len(split.train)} val={len(split.val)} test={len(split.test)}")
+    for gene in args.genes:
+        print(f"  {gene}: population_mean(train)={table.population_mean.get(gene, float('nan')):.4f}")

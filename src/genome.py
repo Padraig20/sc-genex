@@ -1,18 +1,21 @@
 """Reference genome, gene-TSS annotation, and personalized-sequence construction.
 
-This module reproduces the personalized-input-sequence step of Variformer
-(https://github.com/shirondru/enformer_fine_tuning) without needing to
-materialize per-haplotype consensus FASTA files via bcftools/samtools.
+Two personalized-sequence representations live here:
 
-Variformer one-hot encodes each of a donor's two haplotypes and averages them,
-so a heterozygous SNP becomes 0.5/0.5 in the input. For unphased, biallelic
-SNPs, that average only depends on the alt-allele dosage (0, 1, or 2 copies),
-not on which haplotype the alt allele sits on:
+1. `build_personalized_onehot` -- a **dosage-averaged**, phase-agnostic single
+   sequence per donor (kept for the PrediXcan/heritability baseline in
+   `src/heritability.py`, which only needs dosage, not phase).
+2. `build_haplotype_onehots` -- **phased** maternal/paternal haplotype
+   sequences, read directly from the VCF's phased `GT` field (e.g. `0|1`),
+   matching pSAGE-net's `PersonalGenomeDataset` (see
+   https://github.com/mostafavilabuw/SAGEnet). This is what the model's
+   dataset (`src/dataset.py`) actually trains on. It assumes input VCFs are
+   already phased (e.g. from imputation/statistical phasing upstream) -- no
+   phasing is performed by this pipeline.
 
-    onehot = (1 - dosage / 2) * onehot(ref) + (dosage / 2) * onehot(alt)
-
-So we can build the same input directly from VCF genotypes with `pysam`,
-without ever generating consensus FASTAs.
+Both avoid materializing per-haplotype consensus FASTA files via
+bcftools/samtools; genotypes are read directly with `pysam` and applied to an
+already-fetched reference one-hot array.
 """
 from __future__ import annotations
 
@@ -62,6 +65,7 @@ class GeneRecord:
     start: int  # 0-based, GTF-style inclusive start converted to 0-based
     end: int  # exclusive
     strand: str
+    biotype: Optional[str] = None  # e.g. "protein_coding" (GTF `gene_type`/`gene_biotype`)
 
     @property
     def tss(self) -> int:
@@ -70,7 +74,7 @@ class GeneRecord:
 
 
 class GeneAnnotation:
-    """Minimal GTF parser that extracts gene-level records (chrom, TSS, strand).
+    """Minimal GTF parser that extracts gene-level records (chrom, TSS, strand, biotype).
 
     Deliberately avoids a heavyweight GTF-parsing dependency: a POC only needs
     the `gene` feature rows, which is a handful of columns per gene.
@@ -102,6 +106,8 @@ class GeneAnnotation:
                     continue
                 gene_id = gene_id.split(".")[0]  # strip Ensembl version suffix
                 gene_name = attrs.get("gene_name")
+                # GENCODE uses "gene_type", Ensembl uses "gene_biotype" -- accept either.
+                biotype = attrs.get("gene_type") or attrs.get("gene_biotype")
                 record = GeneRecord(
                     gene_id=gene_id,
                     gene_name=gene_name,
@@ -109,6 +115,7 @@ class GeneAnnotation:
                     start=int(start) - 1,  # GTF is 1-based inclusive -> 0-based
                     end=int(end),
                     strand=strand,
+                    biotype=biotype,
                 )
                 self._by_gene_id[gene_id] = record
                 if gene_name:
@@ -122,6 +129,10 @@ class GeneAnnotation:
         if gene in self._by_gene_name:
             return self._by_gene_name[gene]
         raise KeyError(f"Gene '{gene}' not found in GTF annotation at {self.gtf_path}")
+
+    def all_records(self) -> List[GeneRecord]:
+        """Returns every parsed gene record (one per unique `gene_id`)."""
+        return list(self._by_gene_id.values())
 
 
 def _smart_open(path: str):
@@ -282,6 +293,45 @@ class VCFGenotypeReader:
         dosage = np.stack(dosage_columns, axis=1)  # [n_samples, n_variants]
         return positions, ref_alt, dosage
 
+    def get_phased_genotypes_in_region(
+        self, chrom: str, start: int, end: int, sample_id: str
+    ) -> Dict[int, Tuple[str, str, int, int, bool]]:
+        """Returns {0-based position: (ref, alt, allele0, allele1, phased)} for biallelic SNPs.
+
+        Unlike `get_dosages_in_region` (collapses a genotype to a single
+        dosage count, 0/1/2), this keeps the two alleles -- and whether the
+        call is marked `phased` -- separate, which is what's needed to build
+        distinct maternal (`allele0`) and paternal (`allele1`) haplotype
+        sequences (see `build_haplotype_onehots`). Multi-allelic sites,
+        indels, and missing genotypes are skipped, same as
+        `get_dosages_in_region`.
+        """
+        vcf = self._get_vcf(chrom)
+        if sample_id not in vcf.header.samples:
+            raise KeyError(f"Sample '{sample_id}' not found in VCF for chromosome '{chrom}'")
+
+        out: Dict[int, tuple[str, str, int, int, bool]] = {}
+        for record in vcf.fetch(chrom, max(start, 0), end):
+            ref = record.ref
+            alts = record.alts
+            if ref is None or alts is None or len(alts) != 1:
+                continue  # skip multi-allelic sites for this POC
+            alt = alts[0]
+            if len(ref) != 1 or len(alt) != 1:
+                continue  # SNPs only, no indels
+
+            sample = record.samples[sample_id]
+            genotype = sample.get("GT")
+            if genotype is None or len(genotype) != 2 or any(allele is None for allele in genotype):
+                continue  # missing or non-diploid genotype
+            allele0, allele1 = genotype
+            if allele0 not in (0, 1) or allele1 not in (0, 1):
+                continue  # defensive: shouldn't happen for a biallelic record
+
+            pos_0based = record.pos - 1  # VCF POS is 1-based
+            out[pos_0based] = (ref.upper(), alt.upper(), int(allele0), int(allele1), bool(sample.phased))
+        return out
+
     def close(self) -> None:
         for vcf in self._open_files.values():
             vcf.close()
@@ -326,6 +376,82 @@ def build_personalized_onehot(
         onehot[rel_pos] = (1.0 - dosage / 2.0) * ref_vec + (dosage / 2.0) * alt_vec
 
     return onehot
+
+
+class UnphasedHeterozygousSiteError(ValueError):
+    """Raised when a heterozygous site lacks phase information and `strict_phasing=True`."""
+
+
+def build_haplotype_onehots(
+    reference: ReferenceGenome,
+    vcf_reader: VCFGenotypeReader,
+    sample_id: str,
+    chrom: str,
+    start: int,
+    end: int,
+    strict_phasing: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Builds separate maternal/paternal one-hot sequences for `sample_id` over [start, end).
+
+    This is pSAGE-net's personal-sequence construction (see
+    `PersonalGenomeDataset.get_personal_tensor` at
+    https://github.com/mostafavilabuw/SAGEnet/blob/main/SAGEnet/data.py):
+    each haplotype is built independently by applying one allele per site
+    (`allele0` -> maternal, `allele1` -> paternal, per the VCF's `GT` field
+    order) to the reference sequence, *without* averaging them together --
+    unlike `build_personalized_onehot`, which discards phase entirely.
+    Restricted to biallelic SNPs (no indels), like the rest of this codebase.
+
+    Homozygous sites (`allele0 == allele1`) don't need phase information --
+    both haplotypes get the same allele regardless of which is "first" in the
+    VCF record. Heterozygous sites do: if such a site isn't marked `phased`
+    (pysam's `sample.phased`), assigning its alleles to a specific haplotype
+    would fabricate information the data doesn't actually contain. By
+    default (`strict_phasing=False`) such sites are skipped for both
+    haplotypes (left at the reference base) with the assumption that input
+    VCFs are already phased and this should be rare; pass
+    `strict_phasing=True` to raise `UnphasedHeterozygousSiteError` instead,
+    e.g. to fail loudly if you suspect your VCFs are not actually phased.
+
+    Returns:
+        (maternal_onehot, paternal_onehot), each `[end - start, 4]` float32.
+    """
+    ref_seq = reference.fetch(chrom, start, end)
+    assert len(ref_seq) == end - start, (
+        f"Reference fetch returned {len(ref_seq)} bases, expected {end - start} "
+        f"for region {chrom}:{start}-{end}"
+    )
+    maternal = one_hot_encode_sequence(ref_seq)
+    paternal = one_hot_encode_sequence(ref_seq)
+
+    genotypes = vcf_reader.get_phased_genotypes_in_region(chrom, start, end, sample_id)
+    for pos, (ref_allele, alt_allele, allele0, allele1, phased) in genotypes.items():
+        rel_pos = pos - start
+        if rel_pos < 0 or rel_pos >= maternal.shape[0]:
+            continue
+        observed_ref = ref_seq[rel_pos]
+        if observed_ref != ref_allele:
+            # Reference genome disagrees with the VCF's REF allele at this site
+            # (e.g. wrong genome build) -- skip rather than silently corrupt the input
+            continue
+
+        is_heterozygous = allele0 != allele1
+        if is_heterozygous and not phased:
+            if strict_phasing:
+                raise UnphasedHeterozygousSiteError(
+                    f"Heterozygous, unphased genotype for sample '{sample_id}' at "
+                    f"{chrom}:{pos + 1} -- input VCFs are expected to be phased "
+                    "(pass strict_phasing=False to skip such sites instead)"
+                )
+            continue  # cannot safely assign this site to a haplotype -- skip both
+
+        alt_vec = BASE_TO_ONE_HOT.get(alt_allele, BASE_TO_ONE_HOT["N"])
+        if allele0 == 1:
+            maternal[rel_pos] = alt_vec
+        if allele1 == 1:
+            paternal[rel_pos] = alt_vec
+
+    return maternal, paternal
 
 
 def onek1k_sample_id_from_donor_id(donor_id: str, prefix: str = "OneK1K_") -> str:
