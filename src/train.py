@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -228,11 +229,15 @@ def build_pipeline(args: argparse.Namespace):
 
 
 @torch.no_grad()
-def run_eval(model: PSAGEnetSC, dataset: PersonalGenomeEvalDataset, device: str, batch_size: int) -> pd.DataFrame:
+def run_eval(
+    model: PSAGEnetSC, dataset: PersonalGenomeEvalDataset, device: str, batch_size: int, desc: str = "eval"
+) -> pd.DataFrame:
     model.eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_eval_batch)
     rows: List[dict] = []
-    for ref, mat, pat, pseudobulk_mean, pseudobulk_std, population_mean, n_cells, gene_ids, donor_ids in loader:
+    for ref, mat, pat, pseudobulk_mean, pseudobulk_std, population_mean, n_cells, gene_ids, donor_ids in tqdm(
+        loader, desc=desc, leave=False
+    ):
         ref, mat, pat = ref.to(device), mat.to(device), pat.to(device)
         m_hat, d_hat, sigma_d_hat = model(ref, mat, pat)
         mu_hat = (m_hat + d_hat).cpu().numpy()
@@ -339,10 +344,12 @@ def main() -> None:
     best_state: Optional[dict] = None
     epochs_without_improvement = 0
 
-    for epoch in range(args.epochs):
+    epoch_bar = tqdm(range(args.epochs), desc="epochs")
+    for epoch in epoch_bar:
         model.train()
         losses, mean_losses, diff_losses = [], [], []
-        for ref, mat, pat, population_mean, cell_diff, gene_ids, donor_ids in train_loader:
+        batch_bar = tqdm(train_loader, desc=f"epoch {epoch} [train]", leave=False)
+        for ref, mat, pat, population_mean, cell_diff, gene_ids, donor_ids in batch_bar:
             ref, mat, pat = ref.to(args.device), mat.to(args.device), pat.to(args.device)
             population_mean = population_mean.to(args.device)
             cell_diff = [t.to(args.device) for t in cell_diff]
@@ -361,6 +368,7 @@ def main() -> None:
             losses.append(loss_components.total.item())
             mean_losses.append(loss_components.mean_loss.item())
             diff_losses.append(loss_components.diff_loss.item())
+            batch_bar.set_postfix(loss=f"{losses[-1]:.4f}", mean=f"{mean_losses[-1]:.4f}", diff=f"{diff_losses[-1]:.4f}")
 
         log_payload = {
             "train/loss": float(np.mean(losses)) if losses else float("nan"),
@@ -368,14 +376,16 @@ def main() -> None:
             "train/diff_loss": float(np.mean(diff_losses)) if diff_losses else float("nan"),
             "epoch": epoch,
         }
-        print(f"[epoch {epoch}] train_loss={log_payload['train/loss']:.4f}")
+        tqdm.write(f"[epoch {epoch}] train_loss={log_payload['train/loss']:.4f}")
 
         if epoch % args.eval_every == 0:
-            monitor_df = run_eval(model, eval_datasets["seen_gene_val_donor"], args.device, args.eval_batch_size)
+            monitor_df = run_eval(
+                model, eval_datasets["seen_gene_val_donor"], args.device, args.eval_batch_size, desc=f"epoch {epoch} [val]"
+            )
             monitor_metrics = summarize_eval(monitor_df, "val")
             log_payload.update(monitor_metrics)
             monitor = monitor_metrics["val/mean_median_per_gene_pearson_r"]
-            print(
+            tqdm.write(
                 f"[epoch {epoch}] val/mean_median_per_gene_pearson_r="
                 f"{monitor:.4f}" if not np.isnan(monitor) else f"[epoch {epoch}] val metric undefined (nan)"
             )
@@ -386,11 +396,12 @@ def main() -> None:
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
+            epoch_bar.set_postfix(val_r=f"{monitor:.4f}", best=f"{best_metric:.4f}", no_improve=epochs_without_improvement)
 
         logger.log(log_payload, step=epoch)
 
         if epochs_without_improvement >= args.patience:
-            print(f"[early stop] no val/mean_median_per_gene_pearson_r improvement for {args.patience} evals")
+            tqdm.write(f"[early stop] no val/mean_median_per_gene_pearson_r improvement for {args.patience} evals")
             break
 
     if best_state is not None:
@@ -400,14 +411,16 @@ def main() -> None:
 
     print("[final] evaluating full 4-way seen/unseen-gene x seen/unseen-individual matrix")
     final_summary: Dict[str, float] = {}
-    for name in EVAL_MATRIX_CELLS:
-        df = run_eval(model, eval_datasets[name], args.device, args.eval_batch_size)
+    for name in tqdm(EVAL_MATRIX_CELLS, desc="final 4-way matrix"):
+        df = run_eval(model, eval_datasets[name], args.device, args.eval_batch_size, desc=f"final [{name}]")
         df.to_csv(os.path.join(out_dir, f"predictions_{name}.csv"), index=False)
         metrics = summarize_eval(df, name)
         final_summary.update(metrics)
         mean_r = metrics[f"{name}/mean_median_per_gene_pearson_r"]
         sigma_r = metrics[f"{name}/sigma_median_per_gene_pearson_r"]
-        print(f"[final:{name}] median per-gene Pearson r: mean={mean_r:.4f} sigma={sigma_r:.4f} (n_pairs={metrics[f'{name}/n_pairs']})")
+        tqdm.write(
+            f"[final:{name}] median per-gene Pearson r: mean={mean_r:.4f} sigma={sigma_r:.4f} (n_pairs={metrics[f'{name}/n_pairs']})"
+        )
 
     logger.log(final_summary)
     pd.DataFrame([final_summary]).to_csv(os.path.join(out_dir, "final_eval_matrix_summary.csv"), index=False)

@@ -31,6 +31,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -139,8 +140,8 @@ def main() -> None:
     seen_ds = PersonalGenomeEvalDataset(train_genes, test_donors, table, sequence_builder, max_pairs=args.max_pairs, seed=args.seed)
     unseen_ds = PersonalGenomeEvalDataset(test_genes, test_donors, table, sequence_builder, max_pairs=args.max_pairs, seed=args.seed)
 
-    seen_df = run_eval(model, seen_ds, args.device, args.eval_batch_size)
-    unseen_df = run_eval(model, unseen_ds, args.device, args.eval_batch_size)
+    seen_df = run_eval(model, seen_ds, args.device, args.eval_batch_size, desc="seen genes x test donors")
+    unseen_df = run_eval(model, unseen_ds, args.device, args.eval_batch_size, desc="unseen genes x test donors")
 
     seen_model_r = grouped_correlation(seen_df, true_col="y_true_mean", pred_col="y_pred_mean").per_gene
     unseen_model_r = grouped_correlation(unseen_df, true_col="y_true_mean", pred_col="y_pred_mean").per_gene
@@ -153,7 +154,7 @@ def main() -> None:
     print(f"[predixcan] refitting {len(train_genes)} seen-gene ElasticNet models on train+val donors, evaluating on test donors")
     fit_donors = train_donors + val_donors
     predixcan_rows = []
-    for gene_id in train_genes:
+    for gene_id in tqdm(train_genes, desc="predixcan refit"):
         gene_record = gene_records[gene_id]
         chrom = chrom_for_gene(gene_record, args.vcf_chrom_style)
         start, end = get_tss_window(gene_record, args.window)
