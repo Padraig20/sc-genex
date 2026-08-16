@@ -16,11 +16,17 @@ requested cell type's rows and requested genes' columns are ever read):
 
 Both use the same `log1p(CP-median)` per-cell normalization as the original
 single-gene POC.
+
+`load_celltype_pseudobulk_matrix`/`_read_celltype_gene_submatrix` also accept
+`cell_type=None` ("bulk": pool every cell of every donor, any type), used by
+the reference-only ("r-SAGE-net") pretraining stage in `src/pretrain.py`; see
+`load_bulk_pseudobulk_matrix` for an explicit wrapper and `get_all_donor_ids`
+for the corresponding donor universe.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -57,6 +63,22 @@ def get_celltype_donor_ids(
     return sorted(donors)
 
 
+def get_all_donor_ids(h5ad_path: str, donor_col: str = "donor_id") -> List[str]:
+    """All distinct donors with any cells at all, regardless of cell type.
+
+    Bulk equivalent of `get_celltype_donor_ids` -- used for the cell-type-
+    agnostic reference-only ("r-SAGE-net") pretraining stage (`src/pretrain.py`),
+    which pools all of a donor's cells (any type) into a single bulk-pseudobulk
+    value per gene, mirroring the paper's actual bulk-tissue RNA-seq pretraining
+    data (never any FACS-sorted subset).
+    """
+    if ad is None:
+        raise ImportError("anndata is required to read the OneK1K h5ad file")
+    adata = ad.read_h5ad(h5ad_path, backed="r")
+    donors = adata.obs[donor_col].astype(str).unique().tolist()
+    return sorted(donors)
+
+
 def _resolve_gene_index(var: "pd.DataFrame", gene: str) -> int:
     """Resolves a gene identifier (Ensembl ID or symbol) to a `var` row position."""
     if gene in var.index:
@@ -86,18 +108,26 @@ def _normalize_sparse_rows(X: "sp.spmatrix", total_count: np.ndarray) -> "sp.csr
 
 def _read_celltype_gene_submatrix(
     h5ad_path: str,
-    cell_type: str,
+    cell_type: Optional[str],
     gene_ids: Sequence[str],
     donor_col: str,
     cell_type_col: str,
     library_size_col: str,
 ):
-    """Shared backed-mode h5ad read: cell-type-filtered rows, requested gene columns."""
+    """Shared backed-mode h5ad read: cell-type-filtered rows, requested gene columns.
+
+    `cell_type=None` means "bulk": no cell-type filter at all, every cell of
+    every donor is included (mirroring a real bulk RNA-seq assay over the same
+    sample, used by the reference-only pretraining stage in `src/pretrain.py`).
+    """
     if ad is None:
         raise ImportError("anndata is required to read the OneK1K h5ad file")
 
     adata = ad.read_h5ad(h5ad_path, backed="r")
-    cell_mask = (adata.obs[cell_type_col] == cell_type).to_numpy()
+    if cell_type is None:
+        cell_mask = np.ones(adata.n_obs, dtype=bool)
+    else:
+        cell_mask = (adata.obs[cell_type_col] == cell_type).to_numpy()
     if cell_mask.sum() == 0:
         raise ValueError(f"No cells found for cell_type='{cell_type}'")
 
@@ -123,7 +153,7 @@ class PseudobulkMatrix:
 
 def load_celltype_pseudobulk_matrix(
     h5ad_path: str,
-    cell_type: str,
+    cell_type: Optional[str],
     gene_ids: Sequence[str],
     min_cells_per_donor: int = 1,
     donor_col: str = "donor_id",
@@ -140,6 +170,11 @@ def load_celltype_pseudobulk_matrix(
     `n_donors x n_genes` regardless of how many candidate genes are passed in
     -- this is what makes it cheap enough to run over the full
     protein-coding-autosomal gene universe for heritability ranking.
+
+    `cell_type=None` computes a "bulk" pseudobulk instead: every one of a
+    donor's cells (any type) is pooled together, mirroring a real bulk
+    RNA-seq assay over the same sample -- used by the reference-only
+    pretraining stage (`src/pretrain.py`, `load_bulk_pseudobulk_matrix` below).
     """
     X, donor_id, total_count = _read_celltype_gene_submatrix(
         h5ad_path, cell_type, gene_ids, donor_col, cell_type_col, library_size_col
@@ -165,6 +200,32 @@ def load_celltype_pseudobulk_matrix(
     mean_df = pd.DataFrame(pseudobulk_kept, index=donors_kept, columns=list(gene_ids))
     n_cells = {d: int(n_cells_arr[donor_to_idx[d]]) for d in donors_kept}
     return PseudobulkMatrix(donor_ids=donors_kept, gene_ids=list(gene_ids), mean=mean_df, n_cells=n_cells)
+
+
+def load_bulk_pseudobulk_matrix(
+    h5ad_path: str,
+    gene_ids: Sequence[str],
+    min_cells_per_donor: int = 1,
+    donor_col: str = "donor_id",
+    library_size_col: str = "nCount_RNA",
+) -> PseudobulkMatrix:
+    """Bulk (all-cell-types) pseudobulk matrix -- thin, explicit wrapper around
+    `load_celltype_pseudobulk_matrix(..., cell_type=None, ...)`.
+
+    Used for the r-SAGE-net-style reference-only pretraining stage
+    (`src/pretrain.py`): pools every cell of every donor (regardless of
+    `cell_type`) into one `[donors x genes]` pseudobulk-mean matrix, the
+    closest OneK1K analogue of the paper's actual bulk-tissue RNA-seq
+    pretraining data.
+    """
+    return load_celltype_pseudobulk_matrix(
+        h5ad_path,
+        cell_type=None,
+        gene_ids=gene_ids,
+        min_cells_per_donor=min_cells_per_donor,
+        donor_col=donor_col,
+        library_size_col=library_size_col,
+    )
 
 
 @dataclass

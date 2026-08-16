@@ -47,7 +47,7 @@ from src.dataset import (
 from src.genome import GeneAnnotation, ReferenceGenome, VCFGenotypeReader, onek1k_sample_id_from_donor_id
 from src.loss import psagenet_sc_loss
 from src.metrics import grouped_correlation
-from src.model import PSAGEnetSC
+from src.model import PSAGEnetSC, load_trunk_from_reference_model, validate_trunk_hyperparams
 from src.splits import DonorSplit, GeneSplit, split_donors, split_genes_by_chromosome
 from src.wandb_logger import get_logger
 
@@ -141,6 +141,17 @@ def parse_args() -> argparse.Namespace:
     train_group.add_argument("--out-dir", default=None)
     train_group.add_argument("--wandb", action="store_true")
     train_group.add_argument("--no-save-checkpoint", action="store_true")
+    train_group.add_argument(
+        "--init-from-reference-model",
+        default=None,
+        help=(
+            "Path to a scripts/run_pretrain_reference_model.py --out-dir (r-SAGE-net-style pretraining). "
+            "If set, warm-starts PSAGEnetSC's shared conv/pooling trunk from that run's reference_model.pt "
+            "-- only the trunk transfers (mean/diff/diff_sigma heads are always randomly initialized), "
+            "matching the paper's r-SAGE-net -> p-SAGE-net recipe. Trunk hyperparameters must match exactly "
+            "(see src/model.py::TRUNK_HYPERPARAM_KEYS)."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -349,6 +360,16 @@ def main() -> None:
     model = PSAGEnetSC(**model_config).to(args.device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[model] PSAGEnetSC with {n_params:,} parameters, trunk output dim={model.trunk.output_dim}")
+
+    if args.init_from_reference_model:
+        reference_config_path = os.path.join(args.init_from_reference_model, "reference_model_config.json")
+        reference_ckpt_path = os.path.join(args.init_from_reference_model, "reference_model.pt")
+        with open(reference_config_path) as fh:
+            reference_config = json.load(fh)
+        validate_trunk_hyperparams(model_config, reference_config)
+        reference_state_dict = torch.load(reference_ckpt_path, map_location=args.device)
+        load_trunk_from_reference_model(model, reference_state_dict)
+        print(f"[model] warm-started trunk from {reference_ckpt_path} (r-SAGE-net-style pretraining)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     logger = get_logger(args.wandb, project="sc-genex-psagenet-sc", config=vars(args))

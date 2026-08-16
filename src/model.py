@@ -271,3 +271,124 @@ class PSAGEnetSC(nn.Module):
         sigma_d_hat = F.softplus(self.diff_sigma_out(diff_hidden)).squeeze(-1) + SIGMA_EPS
 
         return m_hat, d_hat, sigma_d_hat
+
+
+class ReferenceExpressionModel(nn.Module):
+    """r-SAGE-net equivalent: reference-sequence-only model predicting a
+    gene's (bulk) population-mean expression, with no personal genome/donor
+    input at all -- mirrors the paper's `rSAGEnet` (own `fc0`/`fclayers`/
+    `ref_out`), trained with plain MSE against per-gene population-mean
+    targets (`src/pretrain.py`).
+
+    Shares `CNNTrunk` and its hyperparameters with `PSAGEnetSC` so that this
+    model's `trunk` submodule's `state_dict()` can be loaded directly into a
+    `PSAGEnetSC.trunk` afterwards (`src/train.py --init-from-reference-model`)
+    -- only the conv/pooling trunk transfers; `feature_proj`/`fc`/`out` here
+    have no counterpart in `PSAGEnetSC` and are never loaded into it.
+    """
+
+    def __init__(
+        self,
+        input_length: int = 40_000,
+        first_layer_kernel_number: int = 900,
+        int_layers_kernel_number: int = 256,
+        first_layer_kernel_size: int = 10,
+        int_layers_kernel_size: int = 5,
+        hidden_size: int = 256,
+        n_conv_blocks: int = 5,
+        n_dilated_conv_blocks: int = 0,
+        h_layers: int = 1,
+        pooling_size: int = 10,
+        pooling_type: str = "avg",
+        batch_norm: bool = True,
+        padding: str = "same",
+        dropout: float = 0.0,
+        increasing_dilation: bool = False,
+    ):
+        super().__init__()
+        self.trunk = CNNTrunk(
+            input_length=input_length,
+            first_layer_kernel_number=first_layer_kernel_number,
+            int_layers_kernel_number=int_layers_kernel_number,
+            first_layer_kernel_size=first_layer_kernel_size,
+            int_layers_kernel_size=int_layers_kernel_size,
+            n_conv_blocks=n_conv_blocks,
+            n_dilated_conv_blocks=n_dilated_conv_blocks,
+            pooling_size=pooling_size,
+            pooling_type=pooling_type,
+            batch_norm=batch_norm,
+            padding=padding,
+            increasing_dilation=increasing_dilation,
+        )
+        self.feature_proj = nn.Sequential(nn.Linear(self.trunk.output_dim, hidden_size), nn.ReLU(inplace=True))
+        self.fc, fc_out_dim = _make_hidden_layers(hidden_size, hidden_size, h_layers, dropout)
+        self.out = nn.Linear(fc_out_dim, 1)
+
+    def forward(self, ref_seq: torch.Tensor) -> torch.Tensor:
+        """`ref_seq`: `[B, L, 4]` one-hot reference sequence (TSS-centered). Returns `m_hat`: `[B]`."""
+        raw = self.trunk(ref_seq.transpose(1, 2))  # Conv1d wants channels-first: [B, 4, L]
+        feat = self.feature_proj(raw)
+        return self.out(self.fc(feat)).squeeze(-1)
+
+
+# The subset of `ReferenceExpressionModel`/`PSAGEnetSC` constructor kwargs that
+# actually determine `CNNTrunk`'s architecture (and therefore its state_dict
+# shapes) -- shared by `src/pretrain.py` (saved alongside `reference_model.pt`)
+# and `src/train.py --init-from-reference-model` (which checks the *current*
+# run's `model_config` against it before loading trunk weights, since a
+# shape/config mismatch would otherwise fail deep inside `load_state_dict`
+# with a much less actionable error). `hidden_size`/`h_layers`/`dropout`/
+# `subtract_or_concat` are deliberately excluded: they affect only
+# `PSAGEnetSC`'s post-trunk heads (or `ReferenceExpressionModel`'s own
+# never-transferred `feature_proj`/`fc`/`out`), not the trunk itself.
+TRUNK_HYPERPARAM_KEYS: Tuple[str, ...] = (
+    "input_length",
+    "first_layer_kernel_number",
+    "int_layers_kernel_number",
+    "first_layer_kernel_size",
+    "int_layers_kernel_size",
+    "n_conv_blocks",
+    "n_dilated_conv_blocks",
+    "pooling_size",
+    "pooling_type",
+    "batch_norm",
+    "padding",
+    "increasing_dilation",
+)
+
+
+def validate_trunk_hyperparams(current_config: dict, reference_config: dict) -> None:
+    """Raises `ValueError` listing every `TRUNK_HYPERPARAM_KEYS` entry that
+    differs between `current_config` (this run's `PSAGEnetSC` `model_config`)
+    and `reference_config` (a pretrained `ReferenceExpressionModel`'s saved
+    `reference_model_config.json`) -- called by `src/train.py
+    --init-from-reference-model` before loading trunk weights, since a
+    shape mismatch would otherwise only surface as a much less actionable
+    error deep inside `load_state_dict`.
+    """
+    mismatches = []
+    for key in TRUNK_HYPERPARAM_KEYS:
+        current_value = current_config.get(key)
+        reference_value = reference_config.get(key)
+        if current_value != reference_value:
+            mismatches.append(f"  {key}: current={current_value!r} vs reference_model={reference_value!r}")
+    if mismatches:
+        raise ValueError(
+            "Trunk hyperparameter mismatch between this run's model config and the "
+            "--init-from-reference-model checkpoint's reference_model_config.json "
+            "(trunk weights would not load correctly):\n" + "\n".join(mismatches)
+        )
+
+
+def load_trunk_from_reference_model(model: "PSAGEnetSC", reference_state_dict: dict) -> None:
+    """Loads only the `trunk.*` keys of a `ReferenceExpressionModel.state_dict()`
+    into `model.trunk` -- `feature_proj`/`mean_fc`/`mean_out`/`diff_fc`/
+    `diff_out`/`diff_sigma_out` are left randomly initialized, matching the
+    paper exactly ("all parameters in the convolutional and pooling layers of
+    r-SAGE-net are loaded into p-SAGE-net" -- nothing else transfers).
+    """
+    trunk_prefix = "trunk."
+    trunk_state = {k[len(trunk_prefix) :]: v for k, v in reference_state_dict.items() if k.startswith(trunk_prefix)}
+    if not trunk_state:
+        raise ValueError("No 'trunk.*' keys found in the reference model checkpoint's state_dict -- wrong checkpoint file?")
+    model.trunk.load_state_dict(trunk_state, strict=True)

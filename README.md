@@ -21,24 +21,62 @@ Training/eval genes are the top-N (heritability estimate via PrediXcan/elastic n
 is evaluated across all 4 combinations of seen/unseen individual x seen/unseen gene, with a final
 comparison against PrediXcan itself (Pearson r).
 
+No pretrained weights from the original pSAGE-net paper are used anywhere (the paper doesn't release
+any, likely due to ROSMAP/GTEx data-access restrictions) -- but this repo does include an *optional*,
+from-scratch reimplementation of the paper's own two-stage recipe: a reference-sequence-only
+"r-SAGE-net" pretraining stage (`scripts/run_pretrain_reference_model.py`) that can warm-start
+`PSAGEnetSC`'s shared convolutional trunk (`--init-from-reference-model`) before personal-genome
+fine-tuning, see [step 0](#0-optional-pretrain-a-reference-only-trunk-r-sage-net-equivalent) below.
+
 ## Pipeline overview
 
 ```mermaid
 flowchart TD
-    H5AD["onek1k_cellxgene_standardized.h5ad"] --> Herit["1. scripts/run_heritability_ranking.py\nPrediXcan/ElasticNet per gene -> top-N gene list"]
+    H5AD["onek1k_cellxgene_standardized.h5ad"] --> Pretrain["0. (optional) scripts/run_pretrain_reference_model.py\nr-SAGE-net-equivalent: reference seq -> bulk population-mean expr"]
+    Pretrain -->|"trunk weights only"| Train
+    H5AD --> Herit["1. scripts/run_heritability_ranking.py\nPrediXcan/ElasticNet per gene -> top-N gene list"]
     Herit --> Train["2. src/train.py\nPSAGEnetSC, per-cell GNLL, 4-way eval matrix"]
     Train --> Eval["3. src/evaluate.py\nmodel vs. PrediXcan, seen vs. unseen genes"]
 ```
 
+0. **(optional) `scripts/run_pretrain_reference_model.py`**: trains `ReferenceExpressionModel` (an
+   r-SAGE-net equivalent) to predict each gene's population-mean **bulk** expression (pooled across
+   *all* cell types per donor, not one cell type -- see
+   [Pretraining target: bulk](#pretraining-target-bulk) below) from reference sequence alone, across
+   the full protein-coding autosomal gene universe. Its `reference_model.pt` can then warm-start
+   `PSAGEnetSC`'s shared trunk in step 2 via `--init-from-reference-model`.
 1. **`scripts/run_heritability_ranking.py`**: for every protein-coding autosomal gene present in
    the h5ad, fits an ElasticNet model (dosage -> pseudobulk expression, PrediXcan-style) on train
    donors and ranks by held-out (val-donor) Pearson r. Writes the full ranking (resumable) and a
    `top_N_genes.csv`.
 2. **`src/train.py`**: trains `PSAGEnetSC` on the top-N genes x train donors (per-cell targets, no
    pseudobulking), with early stopping on a held-out donor slice, then reports the full 4-way
-   seen/unseen-gene x seen/unseen-individual evaluation matrix.
+   seen/unseen-gene x seen/unseen-individual evaluation matrix. Optionally warm-started from step 0's
+   trunk weights (`--init-from-reference-model`).
 3. **`src/evaluate.py`**: refits PrediXcan on train+val donors for every *seen* (trained-on) gene
    and compares its held-out test-donor Pearson r directly against the trained model's.
+
+### Pretraining target: bulk
+
+Step 0's population-mean target pools a donor's cells across **all cell types** (ignoring
+`obs['cell_type']` entirely), not just the cell type being fine-tuned on in step 2 -- this is the
+closest OneK1K analogue of the paper's actual bulk-tissue (ROSMAP cortex) RNA-seq pretraining data
+(never any FACS-sorted subset), gives far more statistical power (all ~1.25M cells / ~981 donors
+instead of e.g. ~65K cells for a single cell type) for a genome-wide gene universe of comparable
+scale to the paper's 14,786 training genes, and -- crucially -- produces **one reusable pretrained
+trunk checkpoint** shared across every downstream `--cell-type` fine-tuning run, rather than needing
+to re-pretrain once per cell type.
+
+Two caveats worth noting (not solved further here, but low-risk):
+- The bulk pretraining donor split and a given fine-tuning run's cell-type-specific donor split
+  aren't guaranteed to align perfectly (different donor universes -> `split_donors` can assign
+  borderline donors differently even with the same seed). Risk is low since r-SAGE-net never sees
+  personal genotype/variation at all, only reference sequence + an aggregate population statistic --
+  any leakage here is far weaker than the personal-variation leakage the rest of the pipeline already
+  guards against via its donor splits.
+- Similarly, step 0's own gene train/val/test split is independent of any downstream top-N gene
+  list's "unseen" test genes -- some fine-tuning-time "unseen" genes may have been seen (reference-
+  sequence-only) during pretraining. This matches the paper's own setup.
 
 ## What's implemented
 
@@ -48,13 +86,14 @@ flowchart TD
 | `src/splits.py` | `split_donors` (random, seeded) and `split_genes_by_chromosome` (whole chromosomes assigned greedily to train/val/test, so nearby loci never straddle a split). |
 | `src/regression_utils.py` | `ElasticNetBaseline` (the PrediXcan-equivalent regression engine), dosage imputation/MAF filtering, permutation testing. |
 | `src/heritability.py` + `scripts/run_heritability_ranking.py` | Multi-gene PrediXcan/ElasticNet ranking, parallelized across genes, resumable via an incrementally-saved CSV. |
-| `data/preprocess.py` | Loads the OneK1K h5ad (backed mode) for one cell type: `load_celltype_pseudobulk_matrix` (many genes -> per-donor pseudobulk means, used by heritability ranking) and `load_celltype_multigene_cells`/`build_multigene_donor_table` (per-cell values for the smaller final training gene set, plus population means computed from train donors only). |
-| `src/model.py` | `PSAGEnetSC`: shared CNN trunk (`CNNTrunk`, ported from pSAGE-net's conv stack) + 3 FC heads (mean, diff, diff-sigma). |
+| `data/preprocess.py` | Loads the OneK1K h5ad (backed mode): `load_celltype_pseudobulk_matrix` (many genes -> per-donor pseudobulk means for one cell type, or **bulk** across all cell types via `cell_type=None`/`load_bulk_pseudobulk_matrix`, used by heritability ranking and reference-only pretraining respectively) and `load_celltype_multigene_cells`/`build_multigene_donor_table` (per-cell values for the smaller final training gene set, plus population means computed from train donors only). |
+| `src/model.py` | `PSAGEnetSC`: shared CNN trunk (`CNNTrunk`, ported from pSAGE-net's conv stack) + 3 FC heads (mean, diff, diff-sigma). `ReferenceExpressionModel`: the r-SAGE-net-equivalent reference-only pretraining model, reusing `CNNTrunk` (same `trunk` submodule name) + its own `feature_proj`/`fc`/`out`. `TRUNK_HYPERPARAM_KEYS` + `validate_trunk_hyperparams`/`load_trunk_from_reference_model`: the shared-hyperparameter contract and loader used by `--init-from-reference-model`. |
 | `src/loss.py` | `psagenet_sc_loss`: MSE on the mean head + per-cell-weighted Gaussian NLL on the diff/diff-sigma heads. |
 | `src/dataset.py` | `PersonalGenomeDatasetSC` (training: one item per (gene, donor) with per-cell targets) and `PersonalGenomeEvalDataset` (evaluation: one item per (gene, donor) from an arbitrary gene x donor combination, with pseudobulk targets). |
+| `src/pretrain.py` + `scripts/run_pretrain_reference_model.py` | r-SAGE-net-equivalent reference-only pretraining: `ReferenceExpressionDataset` (one item per *gene*, no donor dimension, reference sequence + bulk population-mean target) and a plain-MSE train/eval loop with early stopping + incremental checkpointing, mirroring `src/train.py`'s structure. |
 | `src/metrics.py` | `grouped_correlation`: per-gene and per-donor Pearson r, the primary reporting metric for the 4-way matrix. |
 | `src/wandb_logger.py` | Optional W&B logging; no-op by default. |
-| `src/train.py` | Training CLI: builds the pipeline, trains, early-stops, reports the 4-way matrix. |
+| `src/train.py` | Training CLI: builds the pipeline, optionally warm-starts the trunk from a pretraining run (`--init-from-reference-model`), trains, early-stops, reports the 4-way matrix. |
 | `src/evaluate.py` | Final model-vs-PrediXcan comparison CLI. |
 
 ## Architecture
@@ -86,6 +125,16 @@ branch off. Default hyperparameters are the paper's bolded choices: `first_layer
 `int_layers_kernel_number=256`, `n_conv_blocks=5`, `pooling_size=10`, `hidden_size=256`,
 `h_layers=1` -- yielding a model with ~2.7M parameters (vs. Enformer's ~350M in the prior POC), so
 it trains from scratch on a single GPU (or even CPU, for small runs).
+
+`ReferenceExpressionModel` (`src/model.py`, used by the optional pretraining stage) reuses the exact
+same `CNNTrunk` (same submodule name, `trunk`, and the same architecture-defining hyperparameters --
+`TRUNK_HYPERPARAM_KEYS`) plus its own `feature_proj`/`fc`/single output head, applied to reference
+sequence only -- no maternal/paternal branches, no diff heads, since there's no personal genome
+input at this stage at all. `--init-from-reference-model` (`src/train.py`) copies only this shared
+`trunk`'s weights into a fresh `PSAGEnetSC`; `feature_proj`/`mean_fc`/`mean_out`/`diff_fc`/`diff_out`/
+`diff_sigma_out` are always randomly initialized, matching the paper's own r-SAGE-net -> p-SAGE-net
+transfer exactly ("all parameters in the convolutional and pooling layers of r-SAGE-net are loaded
+into p-SAGE-net").
 
 ## Loss (`src/loss.py`)
 
@@ -139,11 +188,36 @@ supply, as CLI arguments:
 None of these three are auto-downloaded -- this is a deliberate choice to keep the pipeline free of
 network calls at run time.
 
+`scripts/run_pretrain_reference_model.py` (step 0) is the exception: it needs `--genome-fasta` and
+`--gtf` but **no VCF at all** -- r-SAGE-net-style pretraining never touches personal genotype, only
+reference sequence.
+
 ## Usage
 
 ```bash
 uv sync  # installs torch, anndata, pysam, scikit-learn, etc. -- see pyproject.toml
 ```
+
+### 0. (optional) Pretrain a reference-only trunk (r-SAGE-net equivalent)
+
+```bash
+uv run python scripts/run_pretrain_reference_model.py \
+  --h5ad-path data/onek1k_cellxgene_standardized.h5ad \
+  --genome-fasta /path/to/hg38.fa --gtf /path/to/gencode.gtf.gz \
+  --out-dir results/reference_pretrain
+```
+
+Trains `ReferenceExpressionModel` on the full protein-coding autosomal gene universe present in the
+h5ad (typically ~15-20k genes, comparable in scale to the paper's 14,786), predicting each gene's
+**bulk** population-mean expression (pooled across all cell types and train donors -- see
+[Pretraining target: bulk](#pretraining-target-bulk)) from reference sequence alone. This is a
+one-time step: the resulting `--out-dir` is reusable across every downstream `--cell-type`
+fine-tuning run in step 2, since pretraining never depends on a specific cell type or top-N gene
+list. Writes `reference_model.pt`, `reference_model_config.json` (trunk hyperparameters, checked by
+`--init-from-reference-model`), `donor_split.csv`/`gene_split.csv`, and a final held-out-gene
+Pearson r report (`final_test_summary.csv`). Model hyperparameter flags share the same names as
+`src/train.py`'s (`--first-layer-kernel-number`, `--n-conv-blocks`, etc.) so a fine-tuning run can
+reuse identical values.
 
 ### 1. Rank genes by heritability, select the top-N
 
@@ -171,8 +245,17 @@ uv run python src/train.py \
   --cell-type "naive B cell" \
   --top-genes-csv results/heritability/naive_B_cell/top_1000_genes.csv \
   --vcf-dir /path/to/genotypes --genome-fasta /path/to/hg38.fa --gtf /path/to/gencode.gtf.gz \
+  --init-from-reference-model results/reference_pretrain \
   --out-dir results/naive_B_cell_psagenet_sc
 ```
+
+`--init-from-reference-model` (optional, from step 0) warm-starts `PSAGEnetSC`'s shared trunk from a
+pretrained `reference_model.pt`; omit it to train the trunk from scratch, as before. If passed, every
+`TRUNK_HYPERPARAM_KEYS` flag (`--first-layer-kernel-number`, `--pooling-size`, `--seq-len` /
+`input_length`, etc.) must exactly match the values used for that pretraining run, or `src/train.py`
+raises a clear error listing the mismatches before touching any weights (`--hidden-size`/`--h-layers`/
+`--dropout`/`--subtract-or-concat` only affect the never-transferred post-trunk heads, so they're
+free to differ).
 
 `--seed`/`--donor-val-frac`/`--donor-test-frac` must match the values used in step 1 so the donor
 splits agree (defaults do). Writes to `--out-dir`:
@@ -228,6 +311,17 @@ verified with:
   has a known float32-precision issue in its internal Gram-matrix precompute path (a Gram entry
   recomputed in float64 fails strict equality against the float32-computed original); fixed by
   casting to float64 throughout `ElasticNetBaseline`.
+- A full, real end-to-end run of the pretraining stage (`scripts/run_pretrain_reference_model.py`)
+  against a small real-h5ad subset (12 donors, 24 real gene IDs, 6,000 cells across ~25 cell types)
+  combined with a synthetic reference genome/GTF: confirmed the bulk pseudobulk loader
+  (`cell_type=None`), gene-universe construction, donor/gene splits, population-mean targets, the
+  eager reference-sequence-caching dataset, and the plain-MSE train/eval/checkpointing loop all run
+  to completion. Then chained its `reference_model.pt` into `src/train.py --init-from-reference-model`
+  (with matching synthetic phased VCFs) and confirmed: (1) the trunk hyperparameter validation
+  passes and the trunk loads correctly when configs match, producing a working warm-started
+  `PSAGEnetSC` that trains and evaluates normally, and (2) an injected hyperparameter mismatch
+  (`--first-layer-kernel-number`) is caught before any weights are touched, raising a clear,
+  actionable error naming the mismatched field and both values.
 
 ## Out of scope for this project
 
