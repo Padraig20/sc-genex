@@ -82,7 +82,7 @@ Two caveats worth noting (not solved further here, but low-risk):
 
 | File | Responsibility |
 |---|---|
-| `src/genome.py` | GTF parser (gene TSS + biotype), reference FASTA reader, per-chromosome VCF reader (dosage *and* phased-genotype access), and both personalized-sequence builders: `build_personalized_onehot` (dosage-averaged, used by the PrediXcan baseline) and `build_haplotype_onehots` (phased maternal/paternal, used by the model). |
+| `src/genome.py` | GTF parser (gene TSS + biotype), reference FASTA reader, per-chromosome VCF reader (dosage *and* phased-genotype access), both personalized-sequence builders (`build_personalized_onehot`: dosage-averaged, used by the PrediXcan baseline; `build_haplotype_onehots`: phased maternal/paternal, used by the model), and `orient_onehot_by_strand`/`reverse_complement_onehot` (reverse-complements `"-"` strand genes' one-hot arrays so every CNN input is TSS-relative and 5'->3' in the gene's own transcriptional direction). |
 | `src/splits.py` | `split_donors` (random, seeded) and `split_genes_by_chromosome` (whole chromosomes assigned greedily to train/val/test, so nearby loci never straddle a split). |
 | `src/regression_utils.py` | `ElasticNetBaseline` (the PrediXcan-equivalent regression engine), dosage imputation/MAF filtering, permutation testing. |
 | `src/heritability.py` + `scripts/run_heritability_ranking.py` | Multi-gene PrediXcan/ElasticNet ranking, parallelized across genes, resumable via an incrementally-saved CSV. |
@@ -135,6 +135,23 @@ input at this stage at all. `--init-from-reference-model` (`src/train.py`) copie
 `diff_sigma_out` are always randomly initialized, matching the paper's own r-SAGE-net -> p-SAGE-net
 transfer exactly ("all parameters in the convolutional and pooling layers of r-SAGE-net are loaded
 into p-SAGE-net").
+
+**Strand-aware sequences.** `ReferenceGenome.fetch`/`build_haplotype_onehots` always read a window
+in forward (increasing-coordinate) orientation, regardless of the gene's own strand. Both
+`PersonalGenomeSequenceBuilder` (`src/dataset.py`, feeds `PSAGEnetSC`) and `ReferenceExpressionDataset`
+(`src/pretrain.py`, feeds `ReferenceExpressionModel`) reverse-complement every reference/haplotype
+array for `"-"` strand genes via `src/genome.py::orient_onehot_by_strand` before it reaches the CNN
+trunk, so every input is TSS-relative and 5'->3' in the gene's own transcriptional direction -- the
+paper reports this measurably improves mean-expression prediction.
+
+**LR scheduler.** Both `scripts/run_pretrain_reference_model.py` (default `--lr-scheduler cyclic`)
+and `src/train.py` (opt-in via `--lr-scheduler cyclic`, default `none` to preserve prior behavior)
+support wrapping `AdamW` in `torch.optim.lr_scheduler.CyclicLR` (`base_lr=lr/2`, `max_lr=lr*2`,
+`cycle_momentum=False`, stepped every training batch), matching the paper's r-SAGE-net/p-SAGE-net
+training recipe. This is particularly important for `CNNTrunk`'s batch-norm-free first conv layer
+(`batch_norm` is only applied from the second conv block onward, matching the paper), which can
+collapse into a "dying ReLU" state under a fixed, aggressive learning rate; oscillating the LR
+periodically kicks it back out of that regime.
 
 ## Loss (`src/loss.py`)
 
@@ -217,7 +234,8 @@ list. Writes `reference_model.pt`, `reference_model_config.json` (trunk hyperpar
 `--init-from-reference-model`), `donor_split.csv`/`gene_split.csv`, and a final held-out-gene
 Pearson r report (`final_test_summary.csv`). Model hyperparameter flags share the same names as
 `src/train.py`'s (`--first-layer-kernel-number`, `--n-conv-blocks`, etc.) so a fine-tuning run can
-reuse identical values.
+reuse identical values. Defaults to `--lr-scheduler cyclic` (the paper's recipe; see
+[Architecture](#architecture)) -- pass `--lr-scheduler none` to keep a constant `--lr` instead.
 
 ### 1. Rank genes by heritability, select the top-N
 
@@ -256,6 +274,10 @@ pretrained `reference_model.pt`; omit it to train the trunk from scratch, as bef
 raises a clear error listing the mismatches before touching any weights (`--hidden-size`/`--h-layers`/
 `--dropout`/`--subtract-or-concat` only affect the never-transferred post-trunk heads, so they're
 free to differ).
+
+`--lr-scheduler cyclic` (default: `none`, preserving prior behavior) opts into the same `CyclicLR`
+schedule as step 0's default -- worth trying if fine-tuning training loss looks flat/collapsed,
+especially when *not* warm-starting from a pretrained trunk.
 
 `--seed`/`--donor-val-frac`/`--donor-test-frac` must match the values used in step 1 so the donor
 splits agree (defaults do). Writes to `--out-dir`:
@@ -322,6 +344,14 @@ verified with:
   `PSAGEnetSC` that trains and evaluates normally, and (2) an injected hyperparameter mismatch
   (`--first-layer-kernel-number`) is caught before any weights are touched, raising a clear,
   actionable error naming the mismatched field and both values.
+- A synthetic-genome regression test for `orient_onehot_by_strand`/`reverse_complement_onehot`:
+  confirmed `"+"` strand genes are left byte-identical and `"-"` strand genes are exactly the
+  reverse-complement of the naive (unoriented) fetch, then re-ran the full pretraining ->
+  `--init-from-reference-model` -> fine-tuning chain (mixed `"+"`/`"-"` strand synthetic genes
+  across 10 fake chromosomes) end to end with no errors. Also confirmed `--lr-scheduler cyclic` in
+  both `scripts/run_pretrain_reference_model.py` and `src/train.py` visibly oscillates the
+  optimizer's LR between `lr/2` and `lr*2` batch-by-batch (verified via the training-loop progress
+  bar's `lr=` postfix) and that `--lr-scheduler none` reproduces the prior constant-LR behavior.
 
 ## Out of scope for this project
 

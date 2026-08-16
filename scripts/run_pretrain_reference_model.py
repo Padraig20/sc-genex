@@ -81,6 +81,22 @@ def parse_args() -> argparse.Namespace:
     train_group.add_argument("--weight-decay", type=float, default=0.0)
     train_group.add_argument("--grad-clip", type=float, default=1.0)
     train_group.add_argument("--patience", type=int, default=10)
+    train_group.add_argument(
+        "--lr-scheduler",
+        choices=["cyclic", "none"],
+        default="cyclic",
+        help=(
+            "'cyclic' (default, paper's recipe) wraps AdamW in CyclicLR with base_lr=lr/2, max_lr=lr*2, "
+            "cycle_momentum=False, stepped every training batch -- helps the batch-norm-free first conv "
+            "layer avoid dying-ReLU collapse. 'none' keeps a constant --lr."
+        ),
+    )
+    train_group.add_argument(
+        "--lr-scheduler-step-size-up",
+        type=int,
+        default=2000,
+        help="Training iterations for CyclicLR to ramp base_lr -> max_lr (and the same count back down); ignored if --lr-scheduler none",
+    )
     train_group.add_argument("--num-workers", type=int, default=0)
     train_group.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     train_group.add_argument("--out-dir", required=True)
@@ -150,6 +166,8 @@ def main() -> None:
         patience=args.patience,
         num_workers=args.num_workers,
         save_checkpoint=not args.no_save_checkpoint,
+        lr_scheduler=args.lr_scheduler,
+        lr_scheduler_step_size_up=args.lr_scheduler_step_size_up,
         logger=logger,
     )
 

@@ -16,6 +16,11 @@ Two personalized-sequence representations live here:
 Both avoid materializing per-haplotype consensus FASTA files via
 bcftools/samtools; genotypes are read directly with `pysam` and applied to an
 already-fetched reference one-hot array.
+
+Both are also always fetched in forward-strand (increasing-coordinate)
+orientation; callers (`src/dataset.py`, `src/pretrain.py`) reverse-complement
+`"-"` strand genes via `orient_onehot_by_strand` below before feeding them to
+a CNN, matching the paper's strand-aware convention.
 """
 from __future__ import annotations
 
@@ -55,6 +60,35 @@ def one_hot_encode_sequence(seq: str) -> np.ndarray:
     known_mask = np.isin(np.frombuffer(seq.encode("ascii"), dtype=np.uint8), [ord(b) for b in "ACGT"])
     out[~known_mask] = BASE_TO_ONE_HOT["N"]
     return out
+
+
+# BASE_TO_ONE_HOT's channel order is (A, C, G, T); reverse-complementing an
+# already-one-hot-encoded array is therefore "reverse the length axis, then
+# swap A<->T (channels 0, 3) and C<->G (channels 1, 2)" -- equivalent to, but
+# cheaper than, reverse-complementing the raw string and re-encoding it.
+_REVERSE_COMPLEMENT_CHANNEL_ORDER = [3, 2, 1, 0]
+
+
+def reverse_complement_onehot(onehot: np.ndarray) -> np.ndarray:
+    """Reverse-complements a one-hot encoded `[L, 4]` (A, C, G, T) sequence array."""
+    return onehot[::-1, _REVERSE_COMPLEMENT_CHANNEL_ORDER]
+
+
+def orient_onehot_by_strand(onehot: np.ndarray, strand: str) -> np.ndarray:
+    """Reverse-complements negative-strand genes' one-hot sequences (no-op on `"+"`).
+
+    Fetched windows are always read off the reference in forward (`+`
+    strand/increasing-coordinate) orientation regardless of the gene's own
+    strand, so a `"-"` strand gene's TSS otherwise lands at the *end* of the
+    array pointing "backwards" relative to transcription. The paper's
+    ablations found reverse-complementing `"-"` strand genes so every input
+    is TSS-relative and 5'->3' in the gene's own transcriptional direction
+    measurably improves mean-expression prediction; apply this consistently
+    to every reference/haplotype array before it reaches the CNN trunk.
+    """
+    if strand == "-":
+        return reverse_complement_onehot(onehot)
+    return onehot
 
 
 @dataclass

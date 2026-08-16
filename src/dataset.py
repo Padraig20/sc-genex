@@ -38,6 +38,7 @@ from src.genome import (
     get_tss_window,
     one_hot_encode_sequence,
     onek1k_sample_id_from_donor_id,
+    orient_onehot_by_strand,
 )
 
 
@@ -123,7 +124,8 @@ class PersonalGenomeSequenceBuilder:
     def build_reference(self, gene_id: str) -> np.ndarray:
         if gene_id not in self._ref_cache:
             chrom, start, end = self._window(gene_id)
-            self._ref_cache[gene_id] = one_hot_encode_sequence(self.reference.fetch(chrom, start, end))
+            ref = one_hot_encode_sequence(self.reference.fetch(chrom, start, end))
+            self._ref_cache[gene_id] = orient_onehot_by_strand(ref, self.genes[gene_id].strand)
         return self._ref_cache[gene_id]
 
     def build_haplotypes(self, gene_id: str, donor_id: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -136,6 +138,8 @@ class PersonalGenomeSequenceBuilder:
         mat, pat = build_haplotype_onehots(
             self.reference, self.vcf_reader, sample_id, chrom, start, end, strict_phasing=self.strict_phasing
         )
+        strand = self.genes[gene_id].strand
+        mat, pat = orient_onehot_by_strand(mat, strand), orient_onehot_by_strand(pat, strand)
         self._hap_cache.put(key, (mat, pat))
         return mat, pat
 

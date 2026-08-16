@@ -131,6 +131,22 @@ def parse_args() -> argparse.Namespace:
     train_group.add_argument("--lam-ref", type=float, default=1.0, help="Mean-head MSE loss weight (paper default: 1)")
     train_group.add_argument("--lam-diff", type=float, default=10.0, help="Diff-head GNLL loss weight (paper default: 10)")
     train_group.add_argument(
+        "--lr-scheduler",
+        choices=["cyclic", "none"],
+        default="none",
+        help=(
+            "'cyclic' wraps AdamW in CyclicLR with base_lr=lr/2, max_lr=lr*2, cycle_momentum=False, stepped every "
+            "training batch (matches scripts/run_pretrain_reference_model.py's default r-SAGE-net-style recipe, which "
+            "the paper also uses for p-SAGE-net). Default 'none' keeps a constant --lr, preserving prior behavior."
+        ),
+    )
+    train_group.add_argument(
+        "--lr-scheduler-step-size-up",
+        type=int,
+        default=2000,
+        help="Training iterations for CyclicLR to ramp base_lr -> max_lr (and the same count back down); ignored if --lr-scheduler none",
+    )
+    train_group.add_argument(
         "--max-eval-pairs",
         type=int,
         default=5000,
@@ -372,6 +388,13 @@ def main() -> None:
         print(f"[model] warm-started trunk from {reference_ckpt_path} (r-SAGE-net-style pretraining)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = None
+    if args.lr_scheduler == "cyclic":
+        scheduler = torch.optim.lr_scheduler.CyclicLR(
+            optimizer, base_lr=args.lr / 2, max_lr=args.lr * 2, step_size_up=args.lr_scheduler_step_size_up, cycle_momentum=False
+        )
+    elif args.lr_scheduler != "none":
+        raise ValueError(f"Unknown --lr-scheduler={args.lr_scheduler!r}, expected 'none' or 'cyclic'")
     logger = get_logger(args.wandb, project="sc-genex-psagenet-sc", config=vars(args))
 
     best_metric = -float("inf")
@@ -398,6 +421,8 @@ def main() -> None:
             if args.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
             losses.append(loss_components.total.item())
             mean_losses.append(loss_components.mean_loss.item())

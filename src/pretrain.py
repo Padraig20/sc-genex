@@ -40,7 +40,15 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from data.preprocess import get_all_donor_ids, load_bulk_pseudobulk_matrix
-from src.genome import GeneAnnotation, GeneRecord, ReferenceGenome, chrom_for_gene, get_tss_window, one_hot_encode_sequence
+from src.genome import (
+    GeneAnnotation,
+    GeneRecord,
+    ReferenceGenome,
+    chrom_for_gene,
+    get_tss_window,
+    one_hot_encode_sequence,
+    orient_onehot_by_strand,
+)
 from src.heritability import autosomal_protein_coding_genes
 from src.model import ReferenceExpressionModel
 from src.regression_utils import safe_pearsonr
@@ -104,7 +112,8 @@ class ReferenceExpressionDataset(Dataset):
             gene = gene_records[gene_id]
             chrom = chrom_for_gene(gene, chrom_style)
             start, end = get_tss_window(gene, seq_len)
-            self._sequences[gene_id] = one_hot_encode_sequence(reference.fetch(chrom, start, end))
+            ref = one_hot_encode_sequence(reference.fetch(chrom, start, end))
+            self._sequences[gene_id] = orient_onehot_by_strand(ref, gene.strand)
 
     def __len__(self) -> int:
         return len(self.gene_ids)
@@ -265,6 +274,8 @@ def train_reference_model(
     patience: int = 10,
     num_workers: int = 0,
     save_checkpoint: bool = True,
+    lr_scheduler: str = "cyclic",
+    lr_scheduler_step_size_up: int = 2000,
     logger=None,
 ) -> ReferenceExpressionModel:
     """Plain-MSE training loop with early stopping + incremental best-checkpoint
@@ -272,6 +283,15 @@ def train_reference_model(
     `src/train.py`'s loop (tqdm epoch/batch progress, early stopping,
     checkpointing) but much simpler: no donor dimension, no 4-way eval matrix,
     no GNLL -- just `F.mse_loss` against each gene's population-mean target.
+
+    `lr_scheduler="cyclic"` (the default, matching the paper's r-SAGE-net
+    recipe) wraps `optimizer` in `torch.optim.lr_scheduler.CyclicLR` with
+    `base_lr=lr/2`, `max_lr=lr*2`, `cycle_momentum=False`, stepped once per
+    training batch (CyclicLR is an iteration-level, not epoch-level,
+    scheduler). This helps a from-scratch, no-batch-norm-first-layer
+    `CNNTrunk` (see `src/model.py::CNNTrunk`) escape the "dying ReLU"
+    collapse a fixed, aggressive `lr` can trigger. Pass `"none"` to keep a
+    constant learning rate instead.
     """
     logger = logger if logger is not None else get_logger(False)
     os.makedirs(out_dir, exist_ok=True)
@@ -280,6 +300,14 @@ def train_reference_model(
         train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_reference_batch, num_workers=num_workers
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    scheduler = None
+    if lr_scheduler == "cyclic":
+        scheduler = torch.optim.lr_scheduler.CyclicLR(
+            optimizer, base_lr=lr / 2, max_lr=lr * 2, step_size_up=lr_scheduler_step_size_up, cycle_momentum=False
+        )
+    elif lr_scheduler != "none":
+        raise ValueError(f"Unknown lr_scheduler={lr_scheduler!r}, expected 'none' or 'cyclic'")
 
     best_metric = -float("inf")
     best_state: Optional[dict] = None
@@ -300,9 +328,11 @@ def train_reference_model(
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
             losses.append(loss.item())
-            batch_bar.set_postfix(loss=f"{losses[-1]:.4f}")
+            batch_bar.set_postfix(loss=f"{losses[-1]:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
         log_payload = {"train/loss": float(np.mean(losses)) if losses else float("nan"), "epoch": epoch}
         tqdm.write(f"[epoch {epoch}] train_loss={log_payload['train/loss']:.4f}")
