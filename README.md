@@ -32,19 +32,26 @@ fine-tuning, see [step 0](#0-optional-pretrain-a-reference-only-trunk-r-sage-net
 
 ```mermaid
 flowchart TD
-    H5AD["onek1k_cellxgene_standardized.h5ad"] --> Pretrain["0. (optional) scripts/run_pretrain_reference_model.py\nr-SAGE-net-equivalent: reference seq -> bulk population-mean expr"]
+    H5AD["onek1k_cellxgene_standardized.h5ad"] --> HSearch["0a. (optional) scripts/run_hparam_search.py\nr-SAGE-net hyperparameter search -> best config"]
+    HSearch -->|"best config"| Pretrain
+    H5AD --> Pretrain["0b. (optional) scripts/run_pretrain_reference_model.py\nr-SAGE-net-equivalent: reference seq -> bulk population-mean expr"]
     Pretrain -->|"trunk weights only"| Train
     H5AD --> Herit["1. scripts/run_heritability_ranking.py\nPrediXcan/ElasticNet per gene -> top-N gene list"]
     Herit --> Train["2. src/train.py\nPSAGEnetSC, per-cell GNLL, 4-way eval matrix"]
     Train --> Eval["3. src/evaluate.py\nmodel vs. PrediXcan, seen vs. unseen genes"]
 ```
 
-0. **(optional) `scripts/run_pretrain_reference_model.py`**: trains `ReferenceExpressionModel` (an
-   r-SAGE-net equivalent) to predict each gene's population-mean **bulk** expression (pooled across
-   *all* cell types per donor, not one cell type -- see
-   [Pretraining target: bulk](#pretraining-target-bulk) below) from reference sequence alone, across
-   the full protein-coding autosomal gene universe. Its `reference_model.pt` can then warm-start
-   `PSAGEnetSC`'s shared trunk in step 2 via `--init-from-reference-model`.
+0. **(optional) pretraining, and searching for its hyperparameters:**
+   - **`scripts/run_hparam_search.py`**: reproduces the paper's r-SAGE-net hyperparameter grid search
+     (Methods, "R-SAGE-net training") by running many `scripts/run_pretrain_reference_model.py` trials
+     and ranking them by validation-gene Pearson r -- see
+     [Hyperparameter search](#4-optional-search-for-r-sage-nets-hyperparameters) below.
+   - **`scripts/run_pretrain_reference_model.py`**: trains `ReferenceExpressionModel` (an r-SAGE-net
+     equivalent) to predict each gene's population-mean **bulk** expression (pooled across *all* cell
+     types per donor, not one cell type -- see [Pretraining target: bulk](#pretraining-target-bulk)
+     below) from reference sequence alone, across the full protein-coding autosomal gene universe. Its
+     `reference_model.pt` can then warm-start `PSAGEnetSC`'s shared trunk in step 2 via
+     `--init-from-reference-model`.
 1. **`scripts/run_heritability_ranking.py`**: for every protein-coding autosomal gene present in
    the h5ad, fits an ElasticNet model (dosage -> pseudobulk expression, PrediXcan-style) on train
    donors and ranks by held-out (val-donor) Pearson r. Writes the full ranking (resumable) and a
@@ -74,23 +81,47 @@ Two caveats worth noting (not solved further here, but low-risk):
   personal genotype/variation at all, only reference sequence + an aggregate population statistic --
   any leakage here is far weaker than the personal-variation leakage the rest of the pipeline already
   guards against via its donor splits.
-- Similarly, step 0's own gene train/val/test split is independent of any downstream top-N gene
-  list's "unseen" test genes -- some fine-tuning-time "unseen" genes may have been seen (reference-
-  sequence-only) during pretraining. This matches the paper's own setup.
+- Step 0's gene train/val/test split and step 2's are each computed independently (once per run), but
+  both default to the *same* fixed chromosome ranges (see [Train/val/test splits](#trainvaltest-splits)
+  below), so a gene's split assignment is actually consistent between pretraining and fine-tuning by
+  default -- some fine-tuning-time "unseen" genes may still have been *seen* (reference-sequence-only,
+  no personal genotype) during pretraining only if `--gene-split-scheme greedy` is used for one stage
+  and not the other. This matches the paper's own setup either way.
+
+### Train/val/test splits
+
+Both `--gene-split-scheme` (gene split) and the donor-split fractions default to the paper's own
+splits, so results are directly comparable to the paper's:
+
+- **Genes** (`src/splits.py::split_genes_by_paper_chromosomes`, `--gene-split-scheme paper`,
+  default): the paper's *fixed* chromosome ranges (Methods, "Gene sets") -- train = chromosomes 1-16,
+  validation = chromosomes 17, 18, 21, 22, test = chromosomes 19, 20 (78%/11%/11% of their ~19.8k-gene
+  universe). A given chromosome always lands in the same split regardless of how many genes from it
+  are present, so results are directly comparable to the paper's own per-chromosome breakdown. This
+  can leave a split *empty* for a small/biased gene subset (e.g. a top-N heritability-ranked gene list
+  with nothing on chromosomes 19/20) -- pass `--gene-split-scheme greedy` to fall back to a dynamic,
+  gene-count-balanced chromosome assignment instead (`split_genes_by_chromosome`, tunable via
+  `--gene-val-frac`/`--gene-test-frac`) if that happens.
+- **Donors/individuals** (`src/splits.py::split_donors`, `--donor-val-frac`/`--donor-test-frac`,
+  `--val-frac`/`--test-frac` for `scripts/run_heritability_ranking.py`): random, seeded, defaulting to
+  `0.10`/`0.10` -- an 80%/10%/10% train/val/test split, matching the paper's actual ROSMAP split
+  ("individuals are split randomly into train (n=689), validation (n=85), and test (n=85) sets to
+  achieve an 80%/10%/10% split" -- Methods).
 
 ## What's implemented
 
 | File | Responsibility |
 |---|---|
 | `src/genome.py` | GTF parser (gene TSS + biotype), reference FASTA reader, per-chromosome VCF reader (dosage *and* phased-genotype access), both personalized-sequence builders (`build_personalized_onehot`: dosage-averaged, used by the PrediXcan baseline; `build_haplotype_onehots`: phased maternal/paternal, used by the model), and `orient_onehot_by_strand`/`reverse_complement_onehot` (reverse-complements `"-"` strand genes' one-hot arrays so every CNN input is TSS-relative and 5'->3' in the gene's own transcriptional direction). |
-| `src/splits.py` | `split_donors` (random, seeded) and `split_genes_by_chromosome` (whole chromosomes assigned greedily to train/val/test, so nearby loci never straddle a split). |
+| `src/splits.py` | `split_donors` (random, seeded, default 80/10/10 -- the paper's ROSMAP split); `split_genes_by_paper_chromosomes` (the paper's fixed chromosome-range gene split, default via `select_gene_split`) and `split_genes_by_chromosome` (dynamic, gene-count-balanced fallback, `--gene-split-scheme greedy`). |
 | `src/regression_utils.py` | `ElasticNetBaseline` (the PrediXcan-equivalent regression engine), dosage imputation/MAF filtering, permutation testing. |
 | `src/heritability.py` + `scripts/run_heritability_ranking.py` | Multi-gene PrediXcan/ElasticNet ranking, parallelized across genes, resumable via an incrementally-saved CSV. |
 | `data/preprocess.py` | Loads the OneK1K h5ad (backed mode): `load_celltype_pseudobulk_matrix` (many genes -> per-donor pseudobulk means for one cell type, or **bulk** across all cell types via `cell_type=None`/`load_bulk_pseudobulk_matrix`, used by heritability ranking and reference-only pretraining respectively) and `load_celltype_multigene_cells`/`build_multigene_donor_table` (per-cell values for the smaller final training gene set, plus population means computed from train donors only). |
 | `src/model.py` | `PSAGEnetSC`: shared CNN trunk (`CNNTrunk`, ported from pSAGE-net's conv stack) + 3 FC heads (mean, diff, diff-sigma). `ReferenceExpressionModel`: the r-SAGE-net-equivalent reference-only pretraining model, reusing `CNNTrunk` (same `trunk` submodule name) + its own `feature_proj`/`fc`/`out`. `TRUNK_HYPERPARAM_KEYS` + `validate_trunk_hyperparams`/`load_trunk_from_reference_model`: the shared-hyperparameter contract and loader used by `--init-from-reference-model`. |
 | `src/loss.py` | `psagenet_sc_loss`: MSE on the mean head + per-cell-weighted Gaussian NLL on the diff/diff-sigma heads. |
 | `src/dataset.py` | `PersonalGenomeDatasetSC` (training: one item per (gene, donor) with per-cell targets) and `PersonalGenomeEvalDataset` (evaluation: one item per (gene, donor) from an arbitrary gene x donor combination, with pseudobulk targets). |
-| `src/pretrain.py` + `scripts/run_pretrain_reference_model.py` | r-SAGE-net-equivalent reference-only pretraining: `ReferenceExpressionDataset` (one item per *gene*, no donor dimension, reference sequence + bulk population-mean target) and a plain-MSE train/eval loop with early stopping + incremental checkpointing, mirroring `src/train.py`'s structure. |
+| `src/pretrain.py` + `scripts/run_pretrain_reference_model.py` | r-SAGE-net-equivalent reference-only pretraining: `ReferenceExpressionDataset` (one item per *gene*, no donor dimension, reference sequence + bulk population-mean target) and a plain-MSE train/eval loop with early stopping + incremental checkpointing (including `best_val_summary.csv`, read by `scripts/run_hparam_search.py`), mirroring `src/train.py`'s structure. |
+| `scripts/run_hparam_search.py` | Reproduces the paper's r-SAGE-net hyperparameter grid search: orchestrates many `scripts/run_pretrain_reference_model.py` trials (`--mode one-at-a-time`/`grid`/`random`) and ranks them by validation-gene Pearson r into a `leaderboard.csv`. |
 | `src/metrics.py` | `grouped_correlation`: per-gene and per-donor Pearson r, the primary reporting metric for the 4-way matrix. |
 | `src/wandb_logger.py` | Optional W&B logging; no-op by default. |
 | `src/train.py` | Training CLI: builds the pipeline, optionally warm-starts the trunk from a pretraining run (`--init-from-reference-model`), trains, early-stops, reports the 4-way matrix. |
@@ -311,6 +342,47 @@ PrediXcan doesn't have a "genes it was/wasn't trained on" concept the way the se
 so `predixcan_pearson_r` is left blank for them; the model's own per-gene Pearson r is still
 reported.
 
+### 4. (optional) Search for r-SAGE-net's hyperparameters
+
+```bash
+uv run python scripts/run_hparam_search.py \
+  --h5ad-path data/onek1k_cellxgene_standardized.h5ad \
+  --genome-fasta /path/to/hg38.fa --gtf /path/to/gencode.gtf.gz \
+  --out-dir results/hparam_search --epochs 100 --patience 10
+```
+
+Reproduces the paper's r-SAGE-net hyperparameter tuning (Methods, "R-SAGE-net training": grid search
+over `first_layer_kernel_number`, `int_layers_kernel_number`, `first_layer_kernel_size`,
+`n_conv_blocks`, `pooling_size`, `pooling_type`, `n_dilated_conv_blocks`, `dropout`, `h_layers`,
+`increasing_dilation`, `batch_norm`, `hidden_size`, `learning_rate` -- their own bolded selection is
+already every script/model default in this repo). Each trial is a full
+`scripts/run_pretrain_reference_model.py` run (the paper tunes hyperparameters on r-SAGE-net, then
+reuses the winning config for p-SAGE-net verbatim: "All model hyperparameters are the same for
+p-SAGE-net as r-SAGE-net"), scored by validation-gene Pearson r. Training-recipe flags
+(`--batch-size 16`, `--weight-decay 1e-5`, `--grad-clip 1.0`, `--lr-scheduler cyclic`, `--epochs 100`,
+`--patience 10`) default to the paper's fixed r-SAGE-net recipe regardless of
+`scripts/run_pretrain_reference_model.py`'s own (slightly different) defaults, so this command alone
+reproduces the paper's setup with no extra flags needed.
+
+Writes one subdirectory per trial (`--out-dir/trial_*`, each a full
+`scripts/run_pretrain_reference_model.py --out-dir`) and a `leaderboard.csv` ranking every trial by
+`val/pearson_r`, plus prints the winning trial's exact flags at the end -- copy them straight into a
+final, longer `scripts/run_pretrain_reference_model.py` run (and `src/train.py`, whose
+`TRUNK_HYPERPARAM_KEYS` flags must then match exactly for `--init-from-reference-model`). Three
+`--mode`s:
+- `one-at-a-time` (**default**): the only tractable reading of "grid search over: ... our selection is
+  bolded" -- varies ONE hyperparameter at a time away from the paper's bolded config (18 trials
+  total). The literal full factorial grid has 41,472 combinations, clearly far more than any paper
+  plausibly reports training.
+- `random --n-trials N`: samples `N` distinct combinations uniformly from the full grid -- a practical
+  way to explore more of the space than `one-at-a-time` without the intractable full factorial.
+- `grid`: the literal full factorial grid (41,472 combinations) -- requires `--max-trials 41472` (or
+  `--force`), a safety check against accidentally launching tens of thousands of training runs.
+
+Resumable (a trial with an existing `best_val_summary.csv` is skipped; `--no-resume` forces a rerun of
+every trial) and fault-tolerant (a failed trial is recorded in `leaderboard.csv` with its exit code
+rather than aborting the whole search).
+
 ## Testing performed
 
 Real phased VCFs / a real reference genome FASTA / GPU were not available in the development
@@ -352,6 +424,19 @@ verified with:
   both `scripts/run_pretrain_reference_model.py` and `src/train.py` visibly oscillates the
   optimizer's LR between `lr/2` and `lr*2` batch-by-batch (verified via the training-loop progress
   bar's `lr=` postfix) and that `--lr-scheduler none` reproduces the prior constant-LR behavior.
+- A synthetic-genome regression test for the paper-matching splits: confirmed
+  `split_genes_by_paper_chromosomes` assigns genes to train/val/test purely by their (fixed)
+  chromosome, `select_gene_split` raises a clear error when that leaves a split empty (and that
+  `--gene-split-scheme greedy` recovers), and that both `scripts/run_pretrain_reference_model.py` and
+  `src/train.py` default to it end to end (synthetic genes spread across chromosomes 1-8/17/18/19/20)
+  with the expected train/val/test gene counts and an 80/10/10-ish donor split.
+- A full, real end-to-end run of `scripts/run_hparam_search.py` (`--mode one-at-a-time`, all 18
+  trials, against the same small synthetic setup) confirmed: every trial's CLI args render correctly
+  (including the two inverted/boolean hyperparameters, `--increasing-dilation` and `--no-batch-norm`),
+  `leaderboard.csv` is written and correctly ranks trials by `val/pearson_r`, the best trial's flags
+  are printed correctly at the end, resuming a completed search skips every already-finished trial,
+  `--dry-run` plans without executing, and `--mode grid`'s 41,472-trial safety cap raises a clear
+  error unless `--max-trials`/`--force` is passed.
 
 ## Out of scope for this project
 

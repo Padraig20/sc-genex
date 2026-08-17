@@ -1,6 +1,10 @@
 """CLI: r-SAGE-net-style reference-only pretraining -- predicts a gene's
-population-mean (bulk) expression from reference sequence alone, across the
+population-mean expression from reference sequence alone, across the
 full protein-coding autosomal gene universe present in the h5ad.
+
+The population-mean target defaults to **bulk** (all cell types pooled per
+donor). Pass `--cell-type` to instead use that cell type's own pseudobulk,
+matching `src/train.py` / `scripts/run_heritability_ranking.py`.
 
 This is an optional prerequisite step for `src/train.py`: pass the resulting
 `--out-dir` to `src/train.py --init-from-reference-model` to warm-start
@@ -10,11 +14,18 @@ hyperparameter flags below intentionally share names with `src/train.py`'s
 (a mismatch on any of `src/model.py::TRUNK_HYPERPARAM_KEYS` is caught, with a
 clear error, at `--init-from-reference-model` load time).
 
-Example:
+Example (bulk, the default -- one reusable trunk for every fine-tuning cell type):
     python scripts/run_pretrain_reference_model.py \\
         --h5ad-path data/onek1k_cellxgene_standardized.h5ad \\
         --genome-fasta /path/to/hg38.fa --gtf /path/to/gencode.gtf.gz \\
         --out-dir results/reference_pretrain
+
+Example (one cell type only):
+    python scripts/run_pretrain_reference_model.py \\
+        --h5ad-path data/onek1k_cellxgene_standardized.h5ad \\
+        --cell-type "naive B cell" \\
+        --genome-fasta /path/to/hg38.fa --gtf /path/to/gencode.gtf.gz \\
+        --out-dir results/reference_pretrain_naive_B_cell
 """
 from __future__ import annotations
 
@@ -40,12 +51,40 @@ def parse_args() -> argparse.Namespace:
     data_group = parser.add_argument_group("data")
     data_group.add_argument("--h5ad-path", required=True)
     data_group.add_argument(
-        "--min-cells-per-donor", type=int, default=1, help="Min total cells (any cell type) for a donor to count towards bulk pseudobulk"
+        "--cell-type",
+        default=None,
+        help=(
+            "Exact `obs['cell_type']` value, e.g. 'naive B cell'. If omitted (default), the "
+            "population-mean target is bulk pseudobulk (all cell types pooled per donor). If set, "
+            "only cells of this type are used -- matching src/train.py / scripts/run_heritability_ranking.py."
+        ),
     )
-    data_group.add_argument("--donor-val-frac", type=float, default=0.15)
-    data_group.add_argument("--donor-test-frac", type=float, default=0.15)
-    data_group.add_argument("--gene-val-frac", type=float, default=0.15)
-    data_group.add_argument("--gene-test-frac", type=float, default=0.15)
+    data_group.add_argument(
+        "--min-cells-per-donor",
+        type=int,
+        default=1,
+        help=(
+            "Min cells for a donor to count towards the population-mean target. Counted across any "
+            "cell type when --cell-type is omitted (bulk); counted only within --cell-type when set"
+        ),
+    )
+    data_group.add_argument(
+        "--donor-val-frac", type=float, default=0.10, help="Paper default: ROSMAP individuals split 80%%/10%%/10%% train/val/test"
+    )
+    data_group.add_argument("--donor-test-frac", type=float, default=0.10)
+    data_group.add_argument(
+        "--gene-split-scheme",
+        choices=["paper", "greedy"],
+        default="paper",
+        help=(
+            "'paper' (default): the paper's fixed chromosome ranges (train=chr1-16, val=chr17/18/21/22, "
+            "test=chr19/20) -- 78%%/11%%/11%%, matching r-SAGE-net's actual training setup ('n=14,786 "
+            "training genes'). 'greedy': a dynamic, gene-count-balanced fallback (--gene-val-frac/"
+            "--gene-test-frac)."
+        ),
+    )
+    data_group.add_argument("--gene-val-frac", type=float, default=0.15, help="Only used when --gene-split-scheme greedy")
+    data_group.add_argument("--gene-test-frac", type=float, default=0.15, help="Only used when --gene-split-scheme greedy")
     data_group.add_argument("--seed", type=int, default=0)
 
     genome_group = parser.add_argument_group("genome")
@@ -71,6 +110,11 @@ def parse_args() -> argparse.Namespace:
     model_group.add_argument("--pooling-size", type=int, default=10)
     model_group.add_argument("--pooling-type", choices=["avg", "max"], default="avg")
     model_group.add_argument("--no-batch-norm", action="store_true")
+    model_group.add_argument(
+        "--increasing-dilation",
+        action="store_true",
+        help="Exponentially increase dilation across --n-dilated-conv-blocks (default: keep it fixed at 2)",
+    )
     model_group.add_argument("--dropout", type=float, default=0.0)
 
     train_group = parser.add_argument_group("training")
@@ -120,9 +164,11 @@ def main() -> None:
         min_cells_per_donor=args.min_cells_per_donor,
         donor_val_frac=args.donor_val_frac,
         donor_test_frac=args.donor_test_frac,
+        gene_split_scheme=args.gene_split_scheme,
         gene_val_frac=args.gene_val_frac,
         gene_test_frac=args.gene_test_frac,
         seed=args.seed,
+        cell_type=args.cell_type,
     )
     save_splits(args.out_dir, donor_split, gene_split)
 
@@ -139,10 +185,11 @@ def main() -> None:
         "pooling_size": args.pooling_size,
         "pooling_type": args.pooling_type,
         "batch_norm": not args.no_batch_norm,
+        "increasing_dilation": args.increasing_dilation,
         "dropout": args.dropout,
     }
     with open(os.path.join(args.out_dir, "reference_model_config.json"), "w") as fh:
-        json.dump(model_config, fh, indent=2)
+        json.dump({**model_config, "cell_type": args.cell_type}, fh, indent=2)
 
     model = ReferenceExpressionModel(**model_config).to(args.device)
     n_params = sum(p.numel() for p in model.parameters())

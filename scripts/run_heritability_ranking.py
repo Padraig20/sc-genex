@@ -38,8 +38,10 @@ def parse_args() -> argparse.Namespace:
     data_group.add_argument("--h5ad-path", required=True)
     data_group.add_argument("--cell-type", required=True, help="Exact `obs['cell_type']` value, e.g. 'naive B cell'")
     data_group.add_argument("--min-cells-per-donor", type=int, default=5)
-    data_group.add_argument("--val-frac", type=float, default=0.15)
-    data_group.add_argument("--test-frac", type=float, default=0.15)
+    data_group.add_argument(
+        "--val-frac", type=float, default=0.10, help="Paper default: ROSMAP individuals split 80%%/10%%/10%% train/val/test"
+    )
+    data_group.add_argument("--test-frac", type=float, default=0.10)
     data_group.add_argument("--seed", type=int, default=0, help="Must match the --seed used for src/train.py so donor splits line up")
 
     genome_group = parser.add_argument_group("genome")

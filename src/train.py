@@ -48,7 +48,7 @@ from src.genome import GeneAnnotation, ReferenceGenome, VCFGenotypeReader, onek1
 from src.loss import psagenet_sc_loss
 from src.metrics import grouped_correlation
 from src.model import PSAGEnetSC, load_trunk_from_reference_model, validate_trunk_hyperparams
-from src.splits import DonorSplit, GeneSplit, split_donors, split_genes_by_chromosome
+from src.splits import DonorSplit, GENE_SPLIT_SCHEMES, GeneSplit, select_gene_split, split_donors
 from src.wandb_logger import get_logger
 
 # The 4 held-out cells of the seen/unseen-gene x seen/unseen-individual matrix
@@ -77,10 +77,23 @@ def parse_args() -> argparse.Namespace:
         help="CSV with a 'gene_id' column (output of scripts/run_heritability_ranking.py's top_N_genes.csv)",
     )
     data_group.add_argument("--min-cells-per-donor", type=int, default=5)
-    data_group.add_argument("--donor-val-frac", type=float, default=0.15)
-    data_group.add_argument("--donor-test-frac", type=float, default=0.15)
-    data_group.add_argument("--gene-val-frac", type=float, default=0.15)
-    data_group.add_argument("--gene-test-frac", type=float, default=0.15)
+    data_group.add_argument(
+        "--donor-val-frac", type=float, default=0.10, help="Paper default: ROSMAP individuals split 80%%/10%%/10%% train/val/test"
+    )
+    data_group.add_argument("--donor-test-frac", type=float, default=0.10)
+    data_group.add_argument(
+        "--gene-split-scheme",
+        choices=GENE_SPLIT_SCHEMES,
+        default="paper",
+        help=(
+            "'paper' (default): the paper's fixed chromosome ranges (train=chr1-16, val=chr17/18/21/22, "
+            "test=chr19/20), directly comparable to the paper's own results. 'greedy': a dynamic, "
+            "gene-count-balanced fallback (--gene-val-frac/--gene-test-frac) for when 'paper' leaves a "
+            "split empty -- likely for a small/biased --top-genes-csv gene subset."
+        ),
+    )
+    data_group.add_argument("--gene-val-frac", type=float, default=0.15, help="Only used when --gene-split-scheme greedy")
+    data_group.add_argument("--gene-test-frac", type=float, default=0.15, help="Only used when --gene-split-scheme greedy")
     data_group.add_argument(
         "--seed",
         type=int,
@@ -116,6 +129,11 @@ def parse_args() -> argparse.Namespace:
     model_group.add_argument("--pooling-size", type=int, default=10)
     model_group.add_argument("--pooling-type", choices=["avg", "max"], default="avg")
     model_group.add_argument("--no-batch-norm", action="store_true")
+    model_group.add_argument(
+        "--increasing-dilation",
+        action="store_true",
+        help="Exponentially increase dilation across --n-dilated-conv-blocks (default: keep it fixed at 2)",
+    )
     model_group.add_argument("--dropout", type=float, default=0.0)
     model_group.add_argument("--subtract-or-concat", choices=["subtract", "concat"], default="subtract")
 
@@ -211,8 +229,10 @@ def build_pipeline(args: argparse.Namespace):
     )
 
     gene_to_chrom = {g: gene_records[g].chrom for g in gene_ids}
-    gene_split = split_genes_by_chromosome(gene_to_chrom, val_frac=args.gene_val_frac, test_frac=args.gene_test_frac, seed=args.seed)
-    print(f"[genes] {gene_split.summary()}")
+    gene_split = select_gene_split(
+        gene_to_chrom, scheme=args.gene_split_scheme, val_frac=args.gene_val_frac, test_frac=args.gene_test_frac, seed=args.seed
+    )
+    print(f"[genes] scheme={args.gene_split_scheme!r}: {gene_split.summary()}")
 
     compute_population_means(table, donor_split.train)
 
@@ -367,6 +387,7 @@ def main() -> None:
         "pooling_size": args.pooling_size,
         "pooling_type": args.pooling_type,
         "batch_norm": not args.no_batch_norm,
+        "increasing_dilation": args.increasing_dilation,
         "dropout": args.dropout,
         "subtract_or_concat": args.subtract_or_concat,
     }

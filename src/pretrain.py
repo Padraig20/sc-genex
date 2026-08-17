@@ -1,5 +1,5 @@
 """r-SAGE-net-style reference-only pretraining: predicts a gene's population-mean
-(bulk) expression from reference sequence alone, across a large, genome-wide
+expression from reference sequence alone, across a large, genome-wide
 protein-coding-autosomal gene universe -- mirroring pSAGE-net's paper
 ("R-SAGE-net is trained on reference sequence and mean expression ... for
 n = 14,786 training genes"). No personal genome/donor input exists anywhere in
@@ -14,11 +14,16 @@ holds the dataset + core train/eval loop; `scripts/run_pretrain_reference_model.
 is the CLI entry point (mirrors the `src/heritability.py` / `scripts/run_heritability_ranking.py`
 split).
 
-Pretraining target: **bulk**, pooling a donor's cells across *all* cell types
-(not one cell type) -- the closest OneK1K analogue of the paper's actual
-bulk-tissue RNA-seq pretraining data (see `data.preprocess.load_bulk_pseudobulk_matrix`),
+Pretraining target defaults to **bulk**, pooling a donor's cells across *all*
+cell types -- the closest OneK1K analogue of the paper's actual bulk-tissue
+RNA-seq pretraining data (see `data.preprocess.load_bulk_pseudobulk_matrix`),
 and it yields a single reusable pretrained trunk shared across every
-downstream `--cell-type` fine-tuning run.
+downstream `--cell-type` fine-tuning run. Pass `cell_type=` (CLI:
+`--cell-type`) to instead use that cell type's own pseudobulk
+(`load_celltype_pseudobulk_matrix`) as the population-mean target -- useful
+when you want a trunk specialized to the same cell type as fine-tuning,
+at the cost of a smaller donor/cell universe and a checkpoint that is no
+longer shared across cell types.
 """
 from __future__ import annotations
 
@@ -39,7 +44,12 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from data.preprocess import get_all_donor_ids, load_bulk_pseudobulk_matrix
+from data.preprocess import (
+    get_all_donor_ids,
+    get_celltype_donor_ids,
+    load_bulk_pseudobulk_matrix,
+    load_celltype_pseudobulk_matrix,
+)
 from src.genome import (
     GeneAnnotation,
     GeneRecord,
@@ -52,7 +62,7 @@ from src.genome import (
 from src.heritability import autosomal_protein_coding_genes
 from src.model import ReferenceExpressionModel
 from src.regression_utils import safe_pearsonr
-from src.splits import DEFAULT_SEED, DonorSplit, GeneSplit, split_donors, split_genes_by_chromosome
+from src.splits import DEFAULT_SEED, DonorSplit, GeneSplit, select_gene_split, split_donors
 from src.wandb_logger import get_logger
 
 __all__ = [
@@ -76,7 +86,9 @@ def set_seed(seed: int) -> None:
 
 class ReferenceExpressionDataset(Dataset):
     """One item per *gene* (no donor dimension): TSS-window one-hot reference
-    sequence + that gene's population-mean bulk-pseudobulk target.
+    sequence + that gene's population-mean pseudobulk target (bulk by default,
+    or a single cell type when `build_pretrain_pipeline(..., cell_type=...)`
+    is used).
 
     Reference sequences for every gene in `gene_ids` are fetched and one-hot
     encoded eagerly in `__init__` (not lazily on first access), since -- unlike
@@ -137,13 +149,15 @@ def build_pretrain_pipeline(
     seq_len: int = 40_000,
     chrom_style: Optional[str] = None,
     min_cells_per_donor: int = 1,
-    donor_val_frac: float = 0.15,
-    donor_test_frac: float = 0.15,
+    donor_val_frac: float = 0.10,
+    donor_test_frac: float = 0.10,
+    gene_split_scheme: str = "paper",
     gene_val_frac: float = 0.15,
     gene_test_frac: float = 0.15,
     seed: int = DEFAULT_SEED,
+    cell_type: Optional[str] = None,
 ) -> Tuple[ReferenceExpressionDataset, ReferenceExpressionDataset, ReferenceExpressionDataset, DonorSplit, GeneSplit]:
-    """End-to-end: gene universe -> bulk pseudobulk -> donor/gene splits -> population means -> datasets.
+    """End-to-end: gene universe -> pseudobulk -> donor/gene splits -> population means -> datasets.
 
     Reuses the same building blocks as the rest of the pipeline: candidate
     genes via `autosomal_protein_coding_genes` (`src/heritability.py`, the
@@ -151,9 +165,15 @@ def build_pretrain_pipeline(
     per-cell-type heritability ranking), donor/gene splitting via
     `src/splits.py`, and the population-mean convention (mean of *train*
     donors' pseudobulk means) from `data.preprocess.compute_population_means` --
-    reimplemented here directly on the `[donors x genes]` bulk pseudobulk
-    matrix rather than the per-cell `MultiGeneDonorTable`, since bulk
-    pretraining never needs per-cell targets.
+    reimplemented here directly on the `[donors x genes]` pseudobulk matrix
+    rather than the per-cell `MultiGeneDonorTable`, since this stage never
+    needs per-cell targets.
+
+    `cell_type=None` (default) loads **bulk** pseudobulk (every cell of every
+    donor, any type -- `load_bulk_pseudobulk_matrix`). A non-None `cell_type`
+    restricts both the expression matrix and the donor universe to that
+    exact `obs['cell_type']` value, matching `src/train.py` /
+    `scripts/run_heritability_ranking.py`.
     """
     import anndata as ad
 
@@ -167,10 +187,18 @@ def build_pretrain_pipeline(
     gene_records = {g.gene_id: g for g in candidate_genes}
     gene_ids = list(gene_records.keys())
 
-    pb = load_bulk_pseudobulk_matrix(h5ad_path, gene_ids, min_cells_per_donor=min_cells_per_donor)
-    print(f"[pretrain] bulk pseudobulk matrix: {len(pb.donor_ids)} donors x {len(pb.gene_ids)} genes")
+    if cell_type is None:
+        pb = load_bulk_pseudobulk_matrix(h5ad_path, gene_ids, min_cells_per_donor=min_cells_per_donor)
+        donor_universe = get_all_donor_ids(h5ad_path)
+        target_desc = "bulk (all cell types)"
+        min_cells_scope = "any type"
+    else:
+        pb = load_celltype_pseudobulk_matrix(h5ad_path, cell_type, gene_ids, min_cells_per_donor=min_cells_per_donor)
+        donor_universe = get_celltype_donor_ids(h5ad_path, cell_type)
+        target_desc = f"cell type {cell_type!r}"
+        min_cells_scope = f"type {cell_type!r}"
+    print(f"[pretrain] {target_desc} pseudobulk matrix: {len(pb.donor_ids)} donors x {len(pb.gene_ids)} genes")
 
-    donor_universe = get_all_donor_ids(h5ad_path)
     raw_donor_split = split_donors(donor_universe, val_frac=donor_val_frac, test_frac=donor_test_frac, seed=seed)
     pb_donor_set = set(pb.donor_ids)
     donor_split = DonorSplit(
@@ -180,19 +208,22 @@ def build_pretrain_pipeline(
     )
     print(
         f"[pretrain] donors: train={len(donor_split.train)} val={len(donor_split.val)} test={len(donor_split.test)} "
-        f"(out of {len(donor_universe)} total)"
+        f"(out of {len(donor_universe)} total for {target_desc})"
     )
     if len(donor_split.train) == 0:
-        raise ValueError(f"No train donors with >= {min_cells_per_donor} cells (any type) -- cannot compute population means")
+        raise ValueError(
+            f"No train donors with >= {min_cells_per_donor} cells ({min_cells_scope}) -- cannot compute population means"
+        )
 
     gene_to_chrom = {g.gene_id: g.chrom for g in candidate_genes}
-    gene_split = split_genes_by_chromosome(gene_to_chrom, val_frac=gene_val_frac, test_frac=gene_test_frac, seed=seed)
-    print(f"[pretrain] {gene_split.summary()}")
+    gene_split = select_gene_split(gene_to_chrom, scheme=gene_split_scheme, val_frac=gene_val_frac, test_frac=gene_test_frac, seed=seed)
+    print(f"[pretrain] scheme={gene_split_scheme!r}: {gene_split.summary()}")
 
-    # Population mean = mean of TRAIN donors' bulk pseudobulk means, same
+    # Population mean = mean of TRAIN donors' pseudobulk means, same
     # convention as `data.preprocess.compute_population_means` (never uses
     # val/test donors, so val/test genes' targets don't leak val/test-donor
-    # expression into a value they're also scored against).
+    # expression into a value they're also scored against). Bulk vs.
+    # cell-type is already baked into `pb`.
     population_mean = pb.mean.loc[donor_split.train].mean(axis=0).to_dict()
 
     reference = ReferenceGenome(genome_fasta)
@@ -311,6 +342,8 @@ def train_reference_model(
 
     best_metric = -float("inf")
     best_state: Optional[dict] = None
+    best_val_metrics: Optional[Dict[str, float]] = None
+    best_epoch: Optional[int] = None
     epochs_without_improvement = 0
 
     epoch_bar = tqdm(range(epochs), desc="epochs")
@@ -348,10 +381,14 @@ def train_reference_model(
         if not np.isnan(monitor) and monitor > best_metric:
             best_metric = monitor
             best_state = copy.deepcopy(model.state_dict())
+            best_val_metrics = dict(val_metrics)
+            best_epoch = epoch
             epochs_without_improvement = 0
+            # Written incrementally (not just at the end, and regardless of
+            # save_checkpoint) so a crash/OOM/preemption doesn't lose the best-so-far
+            # result, and so scripts/run_hparam_search.py can rank trials without wandb.
+            pd.DataFrame([{**best_val_metrics, "epoch": best_epoch}]).to_csv(os.path.join(out_dir, "best_val_summary.csv"), index=False)
             if save_checkpoint:
-                # Persisted immediately (not just at the end) so a crash/OOM/preemption
-                # later in a long run doesn't lose an already-improved checkpoint.
                 torch.save(best_state, os.path.join(out_dir, "reference_model.pt"))
         else:
             epochs_without_improvement += 1
